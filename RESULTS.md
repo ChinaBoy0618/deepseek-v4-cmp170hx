@@ -247,6 +247,49 @@ migrated to PP0, the rank with the *most* free memory, because under pipeline pa
 leading rank reaches the critical `N` first. Memory pressure only decided which rank noticed
 first. **A clean monotonic correlation is not a cause.**
 
+### ⚠️ Patch 0001 is precautionary, not a fix for an observed bug
+
+Earlier versions of this repo stated as fact that without patch 0001, sm_80 emits
+fluent-looking degenerate text at prompt lengths 2049–4096. **That is withdrawn.** The
+original reporter has retracted it for `dsv4-flash-a100` after building and running the
+branch, and **we could not reproduce it either.**
+
+A/B on this hardware (4× 170HX, PP4 + DSpark, `dsv4-0731-orig`), toggling only the
+`has_device_capability(90)` term, with a one-shot probe confirming which path was actually
+selected each time:
+
+```
+gate ON  → [topk-probe] persistent=False cooperative=False topk_tokens=512
+gate OFF → [topk-probe] persistent=True  cooperative=False topk_tokens=512
+```
+
+Needle retrieval with **`persistent_topk` active** (gate OFF — the allegedly broken path),
+fresh KV cache, candidate counts spanning the claimed band:
+
+| real prompt tokens | candidate count | in band (512–1024)? | needle |
+|---|---|---|---|
+| 1,967 | 491 | no | ✅ |
+| 2,351 | 588 | **yes** | ✅ |
+| 2,813 | 703 | **yes** | ✅ |
+| 3,274 | 818 | **yes** | ✅ |
+| 3,736 | 934 | **yes** | ✅ |
+| 4,120 | 1,030 | no | ✅ |
+| 4,505 | 1,126 | no | ✅ |
+
+Clean throughout, and the answers are coherent — which is what a needle test detects, since
+wrong indices would prevent retrieval.
+
+**And the gate costs nothing either way.** Decode aggregate over 3 runs each: gate ON
+107.1 / 99.3 / 90.8, gate OFF 104.7 / 92.5 / 85.5 — overlapping, inside DSpark's
+[non-determinism](#-dspark-output-is-not-reproducible). Prefill in the band is identical
+(2,399–2,992 tok/s either way).
+
+**So we keep patch 0001 as a free guard** — the failure may well be real on older bases,
+where the reporter first saw it — but nobody should apply it believing this branch is broken
+without it. If you want to check on your own hardware, flip the `has_device_capability(90)`
+term and log `use_persistent_topk` at the selection site; a code read is not sufficient, which
+is the whole lesson here.
+
 ### Four cards required
 | configuration | result |
 |---|---|
