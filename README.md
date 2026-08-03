@@ -3,10 +3,15 @@
 Running **DeepSeek-V4-Flash-0731** (~284B total / ~13B active) on four **NVIDIA CMP 170HX**
 mining cards — GA100 silicon, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no P2P.
 
-**98 tok/s decode · ~5,300 tok/s prefill · 123k verified context · ~$1k of hardware.**
+**98 tok/s decode · ~5,300 tok/s prefill · 123k verified context.**
 
 For scale: a single DGX Spark does ~14 tok/s on this class of model, and a dual-Spark setup
 with speculative decoding reports 55–67.
+
+The 170HX is an ex-mining card with no display output and a fused-down PCIe link, but it is
+GA100 silicon with 64 GB of HBM2e at ~1.6 TB/s once unlocked. Pricing has moved a lot as
+people found LLM uses for them — around **$1,100–1,200 per card** as of August 2026, so
+budget for four accordingly.
 
 This repo contains the patches, container build, launch scripts and benchmark harnesses —
 plus [every setting and why it has that value](SETTINGS.md), and the
@@ -36,8 +41,9 @@ This repo sits on top of that branch.
 - **Exactly 4 CMP 170HX** (or other 64 GB sm_80 cards). **3 cards does not work** — it fails
   in the Marlin MXFP4 expert repack, independent of speculation and memory settings. 2 cards
   cannot hold 140 GB of weights. See [RESULTS](RESULTS.md#four-cards-required).
-- Cards must be **VRAM-unlocked** (65,536 MiB) and, if they are 170HX, have **B30 taped** —
-  an untaped card asserts `PWRBRK#` and runs at ~88 W / 1140 MHz, roughly 4× slow.
+- Cards must be **VRAM-unlocked** — `nvidia-smi` should report 65,536 MiB, not 8,192 MiB.
+- Check the power-brake diagnostic below before benchmarking anything. It is
+  motherboard-specific and most people will not hit it, but it costs ~4× if you do.
 - The original `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint (~140 GB on disk). The
   INT4/compressed-tensors repack is **not** needed; this branch reads the native
   MXFP4+FP8 weights.
@@ -90,6 +96,51 @@ times. Full reasoning in [SETTINGS.md](SETTINGS.md#--pipeline-parallel-size-4--n
 Full tables, correctness testing and limits: **[RESULTS.md](RESULTS.md)**.
 
 ---
+
+## Troubleshooting: cards running ~4× slow (`PWRBRK#` / edge pin B30)
+
+**Check this first if your throughput is nowhere near the numbers here.** It is not a
+property of the CMP 170HX — it is a motherboard behaviour, and most boards do not do it.
+
+`PWRBRK#` is an optional PCIe sideband signal on **edge pin B30** that lets a platform force
+GPUs into an emergency low-power state. Some workstation boards assert it. On an
+**ASUS Pro WS WRX80E-SAGE** (the board these results were produced on) it is asserted on the
+x16 slots, which pins the card in a permanent hardware power brake:
+
+| | braked | healthy |
+|---|---|---|
+| power draw | ~88 W of a 250 W budget | 105–180 W |
+| clocks | 1140 MHz | ~1400 MHz |
+| fp16 | 39.3 TFLOPS | **155.7 TFLOPS** |
+| memory bandwidth | ~608 GB/s | ~1355 GB/s |
+
+### Diagnosing it
+
+```bash
+nvidia-smi -q | grep -A1 "HW Power Brake Slowdown"
+```
+
+`Active` on a card that is not thermally or power limited means the platform is asserting
+`PWRBRK#`. To count healthy cards across a 4-GPU box:
+
+```bash
+nvidia-smi -q | grep -c "HW Power Brake Slowdown  *: Not Active"   # want 4
+```
+
+This is worth ruling out early because it looks exactly like "these mining cards are just
+slow" — the cards are fine, and it cost a great deal of time here before being identified.
+A PCIe riser was what proved it: the same card in the same slot ran at full speed through a
+riser that does not carry B30.
+
+### Fixing it
+
+- **Kapton tape over pin B30** on the card's edge connector (B30 is on the B-side, counted
+  from the notch end). This is the usual fix.
+- **A riser that does not route B30**, which also works and requires no modification.
+- **A BIOS/BMC option**, if your board exposes one — many do not.
+
+If your board does not assert `PWRBRK#`, do nothing. Taping a pin that was never being
+driven gains you nothing and risks damaging the contact.
 
 ## Known limits
 
