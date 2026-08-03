@@ -3,7 +3,7 @@
 Running **DeepSeek-V4-Flash-0731** (~284B total / ~13B active) on four **NVIDIA CMP 170HX**
 mining cards — GA100 silicon, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no P2P.
 
-**98 tok/s decode · ~5,300 tok/s prefill · 123k verified context.**
+**98 tok/s decode · ~5,300 tok/s prefill · 150k verified context.**
 
 For scale: a single DGX Spark does ~14 tok/s on this class of model, and a dual-Spark setup
 with speculative decoding reports 55–67.
@@ -144,9 +144,13 @@ driven gains you nothing and risks damaging the contact.
 
 ## Known limits
 
-- **Context ceiling ~128k.** Verified at 123,120 tokens; ~154k kills a worker with
-  `Xid 31 — MMU Fault`. This is a kernel bug, not memory — the KV pool reports 6.9M tokens.
-  The ceiling sitting near 2¹⁷ suggests a fixed buffer or index width in the sparse indexer.
+- **Context ceiling ~150k, and it scales INVERSELY with `--max-model-len`.** Verified at
+  **150,044 tokens** with `--max-model-len 163840`; the same build only reaches ~131k if you
+  set `--max-model-len 1048576`. **Set it ~10% above what you actually need** — setting it to
+  the model's 1M maximum costs you 20k of usable context for nothing. Above the ceiling a
+  worker dies with `Xid 31 — MMU Fault` in `combine_topk_swa_indices`. Root cause is not
+  established; three upstream PRs were tried and none helped (see
+  [RESULTS](RESULTS.md#root-cause-attempts-that-did-not-work--dont-repeat-these)).
 - **DSpark output is not reproducible** at temperature 0, including run-to-run on the same
   server. Verified to be a property of DSpark itself, not of these patches (the stock
   upstream tensor-parallel path behaves the same way). Quality is unaffected in every test

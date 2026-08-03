@@ -114,23 +114,46 @@ If you need bit-reproducible output, run without `--speculative-config`.
 
 ## Limits
 
-### Context ceiling ~128k — a kernel bug, not memory
-| prompt tokens | result |
+### ★ Context ceiling scales INVERSELY with `--max-model-len`
+
+**Setting `--max-model-len` high costs you usable context.** Measured, needle-in-haystack
+verified at each point:
+
+| `--max-model-len` | highest verified prompt | first failure |
+|---|---|---|
+| 1,048,576 | 130,813 | 133,890 |
+| 262,144 | 135,428 | 153,880 |
+| **163,840** | **150,044** | ~157,700 |
+
+**Set `--max-model-len` to roughly 10% above the context you actually need.** Setting it to
+the model's 1,048,576 maximum reduces usable context to ~131k; setting it to 163,840 gets you
+~150k. This is the single highest-leverage knob for long-context work and costs nothing.
+
+Above the ceiling a worker dies with `Xid 31 — MMU Fault ... ACCESS_TYPE_VIRT_WRITE`. The
+fault surfaces in `combine_topk_swa_indices` (`vllm/models/deepseek_v4/amd/rocm.py` — note
+sm_80 runs the **ROCm** Triton path, which the branch author flagged as "more targeted for
+ROCm instead of CUDA"). The surviving pipeline ranks then emit misleading
+`gloo ... Connection closed by peer` errors — **chase the Xid, not the gloo message.**
+
+Not simple memory exhaustion: at `--max-model-len 1048576` the KV pool reports **6,921,586
+tokens** and the host had 156 GB of RAM free. But it is memory-*pressure* related — the
+indexer prefill buffer is sized `max_model_len * 40 * 132` bytes, i.e. **5.5 GB/rank at 1M
+versus 1.4 GB at 262k**, which is consistent with the inverse relationship above.
+
+### Root-cause attempts that did NOT work — don't repeat these
+
+| tried | result |
 |---|---|
-| 100,044 | PASS (21.5 s TTFT) |
-| **123,120** | **PASS — highest verified** |
-| ~154,000 | worker killed, `Xid 31 — MMU Fault` |
-| ~385,000 | HTTP 500 |
+| PR **#49897** — torch fallback for `top_k_per_row_prefill` (Python) | no change to the ceiling; cost ~10% prefill |
+| PR **#49139** — radix histogram ring fix (CUDA, needs full rebuild) | no change |
+| PR **#50201** — harden `top_k_per_row` against NaN/under-fill (CUDA) | no change |
 
-Not memory exhaustion: at `--max-model-len 1048576` the KV pool reports **6,921,586 tokens**
-(6.6 concurrent 1M-token contexts) and the host had 156 GB of RAM free. The ceiling sits
-close to 2¹⁷ = 131,072, which suggests a fixed-size buffer or index width in the sparse
-indexer path. Two long-context bugs of the same family are already known upstream
-(#49139 radix histogram ring above seq_len 32768; an int32 pointer overflow in the fp8 paged
-MQA logits kernel).
-
-When a worker dies this way the surviving pipeline ranks emit misleading
-`gloo ... Connection closed by peer` errors. **Chase the Xid, not the gloo message.**
+The radix-threshold theory was seductive and wrong: `RADIX_THRESHOLD = 32768` in
+`csrc/libtorch_stable/persistent_topk.cuh`, and with `compress_ratio 4` that lands at exactly
+131,072 context tokens — matching the original boundary to the token. But applying both radix
+PRs (full CUDA rebuild, `TORCH_CUDA_ARCH_LIST=8.0`) changed nothing, and the later
+`max-model-len` sweep showed the boundary is not fixed at 2¹⁷ at all. **An exact numerical
+coincidence is not a diagnosis.**
 
 ### Four cards required
 | configuration | result |

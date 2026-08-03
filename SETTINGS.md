@@ -90,11 +90,22 @@ CUDA toolkit rather than pip CUDA wheels.
 From the working launch command in
 [vllm#50576](https://github.com/vllm-project/vllm/issues/50576).
 
-### `--max-model-len 32768`
-Set to whatever you need **up to about 128k**. Above ~128k a kernel bug produces
-`Xid 31 — MMU Fault` and kills a worker (see RESULTS). Verified working at
-**123,120 tokens**; ~154k faults. Memory would allow far more — the pool reports 6.9M
-tokens at `--max-model-len 1048576` — so this is a software ceiling, not a capacity one.
+### `--max-model-len` — ★ set it to ~10% above what you need, never to the model maximum
+Counter-intuitively, **a larger value gives you LESS usable context**:
+
+| `--max-model-len` | highest verified prompt |
+|---|---|
+| 1,048,576 (model max) | 130,813 |
+| 262,144 | 135,428 |
+| **163,840** | **150,044** |
+
+Above the ceiling a worker dies with `Xid 31 — MMU Fault`. Root cause is not established —
+three upstream PRs were tried and none helped — but the indexer's prefill buffer is sized
+`max_model_len * 40 * 132` bytes, which is **5.5 GB/rank at 1M versus 1.4 GB at 262k**, and
+that matches the direction of the effect.
+
+So: need 100k? Set 110,000. Need 32k? Set 32,768. Setting the model's 1,048,576 maximum
+"just in case" costs you 20k of real context and gains nothing.
 
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
