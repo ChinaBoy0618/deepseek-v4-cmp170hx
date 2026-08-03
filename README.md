@@ -3,7 +3,7 @@
 Running **DeepSeek-V4-Flash-0731** (~284B total / ~13B active) on four **NVIDIA CMP 170HX**
 mining cards — GA100 silicon, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no P2P.
 
-**98 tok/s decode · ~5,300 tok/s prefill · 150k verified context.**
+**98 tok/s decode · ~5,300 tok/s prefill · 1,047,736 verified context — the model's full 1M.**
 
 For scale: a single DGX Spark does ~14 tok/s on this class of model, and a dual-Spark setup
 with speculative decoding reports 55–67.
@@ -144,13 +144,16 @@ driven gains you nothing and risks damaging the contact.
 
 ## Known limits
 
-- **Context ceiling ~150k, and it scales INVERSELY with `--max-model-len`.** Verified at
-  **150,044 tokens** with `--max-model-len 163840`; the same build only reaches ~131k if you
-  set `--max-model-len 1048576`. **Set it ~10% above what you actually need** — setting it to
-  the model's 1M maximum costs you 20k of usable context for nothing. Above the ceiling a
-  worker dies with `Xid 31 — MMU Fault` in `combine_topk_swa_indices`. Root cause is not
-  established; three upstream PRs were tried and none helped (see
-  [RESULTS](RESULTS.md#root-cause-attempts-that-did-not-work--dont-repeat-these)).
+- ~~**Context ceiling ~150k, and it scales INVERSELY with `--max-model-len`.**~~ **FIXED —
+  see [patch 0006](patches/README.md).** The ceiling was the sparse indexer's `[M, N]` float32
+  logits transient; row-chunking it (`DSV4_LOGITS_ROW_CHUNK`) lifts the verified context from
+  ~150k to **1,047,736 tokens**, the model's full 1M. The inverse-scaling advice that used to
+  be here was a symptom of that bug and **no longer applies** — set `--max-model-len` to what
+  you need. Costs nothing measurable; see [RESULTS](RESULTS.md#-context-ceiling--solved).
+- **Long context is slow, not free.** TTFT at 1M is **9.2 minutes** and decode drops to
+  **35.6 tok/s**. Prefill is the expensive half — at the top of its range this is a
+  batch/document tool, not an interactive one. Both curves are in
+  [RESULTS](RESULTS.md#speed-vs-context).
 - **DSpark output is not reproducible** at temperature 0, including run-to-run on the same
   server. Verified to be a property of DSpark itself, not of these patches (the stock
   upstream tensor-parallel path behaves the same way). Quality is unaffected in every test

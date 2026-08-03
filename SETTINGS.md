@@ -90,22 +90,21 @@ CUDA toolkit rather than pip CUDA wheels.
 From the working launch command in
 [vllm#50576](https://github.com/vllm-project/vllm/issues/50576).
 
-### `--max-model-len` — ★ set it to ~10% above what you need, never to the model maximum
-Counter-intuitively, **a larger value gives you LESS usable context**:
+### `--max-model-len` — ★ set it to what you need, up to the model maximum
+**Previous versions of this file said a larger value gives you LESS usable context. That was a
+symptom of the [logits-buffer bug](RESULTS.md#-context-ceiling--solved) and is withdrawn.**
+With `DSV4_LOGITS_ROW_CHUNK` set, the full 1,048,576 works:
 
-| `--max-model-len` | highest verified prompt |
-|---|---|
-| 1,048,576 (model max) | 130,813 |
-| 262,144 | 135,428 |
-| **163,840** | **150,044** |
+| `--max-model-len` | highest verified prompt | `DSV4_LOGITS_ROW_CHUNK` |
+|---|---|---|
+| 393,216 | 388,505 | 256 |
+| **1,048,576** (model max) | **1,047,736** | **128** |
 
-Above the ceiling a worker dies with `Xid 31 — MMU Fault`. Root cause is not established —
-three upstream PRs were tried and none helped — but the indexer's prefill buffer is sized
-`max_model_len * 40 * 132` bytes, which is **5.5 GB/rank at 1M versus 1.4 GB at 262k**, and
-that matches the direction of the effect.
+The only reason not to set the maximum is **time**, not capacity: TTFT at 1M is **9.2 minutes**
+and decode drops to ~40 tok/s. Pick the profile that matches your workload —
 
-So: need 100k? Set 110,000. Need 32k? Set 32,768. Setting the model's 1,048,576 maximum
-"just in case" costs you 20k of real context and gains nothing.
+- everyday, ≤388k → `--max-model-len 393216`, `DSV4_LOGITS_ROW_CHUNK=256`
+- full 1M → `--max-model-len 1048576`, `DSV4_LOGITS_ROW_CHUNK=128`
 
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
@@ -124,6 +123,13 @@ Standard for this model.
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | Required; fork deadlocks with CUDA already initialised. |
 | `HF_HUB_OFFLINE` | `1` | Local weights only; avoids a hub call on every start. |
 | `CUDA_HOME` | set in image | The devel image sets `/usr/local/cuda`. |
+| **`DSV4_LOGITS_ROW_CHUNK`** | **`256`**, or `128` for 1M | ★ **The context-ceiling fix** ([patch 0006](patches/0006-logits-row-chunk.patch)). Row-chunks the sparse indexer's `[M, N]` float32 logits transient. `0` = original upstream path, which dies at ~134k. `256` reaches ~957,600; `128` reaches the full 1,047,736. Costs nothing measurable. |
+| **`VLLM_PP_LAYER_PARTITION`** | `12,12,12,7` | Rebalances the 43 layers off pipeline rank 3, which uniquely carries `lm_head` **and** the DSpark drafter. **Does not affect the context ceiling** — but it removes an 8.7 GiB rank imbalance and grows the KV pool **~85%** (798,660 → 1,476,563 at `max-model-len 163840`). Must be 4 entries summing to 43. |
+
+⚠️ **Do not bother with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — it is a hard
+failure at model load on these cards: `expandable_segments: memory mapping failed with OOM on
+device 3 while trying to map 20971520 bytes (free: 28626452480)`, i.e. it cannot map 20 MB
+with 28.6 GiB free. CUDA VMM appears broken on GA100 CMP parts.
 
 `--shm-size=16g` on the container — the default 64 MB is not enough for multiprocess workers.
 

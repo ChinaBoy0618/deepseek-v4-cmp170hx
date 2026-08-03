@@ -16,7 +16,7 @@ request discarded. Harnesses are in [bench/](bench/).
 | decode, single stream (3-content aggregate) | 50.8 | **98.1 tok/s** |
 | prefill @ 77k context | 5,272 | 5,207 tok/s |
 | aggregate decode @ 64 concurrent | 472.0 | **712.8 tok/s** |
-| verified context | 123,120 tokens | 123,120 tokens |
+| verified context | **1,047,736 tokens** | **1,047,736 tokens** |
 
 ---
 
@@ -69,6 +69,55 @@ TP is flat across a 50× range of context lengths. See [SETTINGS.md](SETTINGS.md
 Time to first token is identical between the two (0.78 s → 14.8 s), i.e. DSpark costs
 nothing on prefill. Acceptance holds at 3.5–3.7 at long context.
 
+## Speed vs context
+
+Measured to the top of the model's range, after the [context-ceiling fix](#-context-ceiling--solved).
+One harness, identical method at every point.
+
+| real context | prefill tok/s | TTFT | decode tok/s |
+|---|---|---|---|
+| ~7,700 | — | 2.1 s | **88.7** |
+| ~100,000 | — | 22.1 s | 79.0 |
+| ~200,000 | 4,486 | 50.5 s | 67.7 |
+| ~385,000 | 3,425 | 120.4 s | 54.5 |
+| ~769,000 | 2,525 | 334–336 s | 39.6 / 43.6 |
+| **~1,040,000** | **1,904** | **544–550 s** | **35.6** |
+
+**Decode degrades gracefully: 88.7 → 35.6 tok/s, i.e. it retains 40% of its short-context rate
+across a 135× context increase.** Generating at a full million tokens of context is still
+faster than most people read.
+
+The 769k row shows two independent runs (39.6 and 43.6) — DSpark is
+[not deterministic](#-dspark-output-is-not-reproducible), so treat single decode numbers as
+±10%.
+
+**Prefill is the expensive half, not decode.** At 1M you wait ~9 minutes for the first token
+and then generate at 35.6 tok/s. Budget accordingly: this is a batch/document tool at the top
+of its range, not an interactive one.
+
+⚠️ **These decode absolutes are a worst case.** Every prompt here is a random-word haystack,
+and DSpark acceptance on random text is poor — prose and code reach 90–130 tok/s at short
+context (see [Decode by content type](#decode-by-content-type)). The *shape* is trustworthy;
+the absolute numbers are pessimistic.
+
+### Why prefill DECAYS with context — and why the section above says it RISES
+
+Both are true at different scales. The rising curve (1,966 → 5,321 tok/s) was measured
+**1.5k → 77k** and stopped there, because the bug killed everything past ~150k.
+
+- **Rising, ≤25k:** fixed per-chunk and pipeline fill/drain costs amortise. Plateau ~5,300.
+- **Falling, ≳200k:** sparse attention keeps *attention* cheap — top-k selects a fixed 512
+  blocks at any length — but **the indexer that chooses them scores every compressed key**,
+  `M × N` with `N = seq_len / compress_ratio`. Confirmed directly: a 121,582-token prompt logs
+  `N = 30,395`, exactly 121,582/4. Per-chunk cost therefore grows linearly with depth, total
+  prefill is quadratic-ish, and throughput falls as 1/context.
+
+Fitting *cost per token = fixed + proportional to position* matches within a few percent
+(200,044 → 4,486 observed / 4,447 model; 538,505 → 3,017 / 3,062; 769,274 → 2,525 / 2,526)
+and puts the crossover at **~550k**. That is a descriptive fit, not a profile.
+
+**The same `M × N` buffer is why prefill decays out there *and* why it used to crash.**
+
 ## Time to first token
 
 | context | PP4 | TP4 |
@@ -114,31 +163,62 @@ If you need bit-reproducible output, run without `--speculative-config`.
 
 ## Limits
 
-### ★ Context ceiling scales INVERSELY with `--max-model-len`
+### ★ Context ceiling — SOLVED
 
-**Setting `--max-model-len` high costs you usable context.** Measured, needle-in-haystack
-verified at each point:
+**The full 1,047,736-token context runs.** That is `--max-model-len 1048576` minus the 24
+generated tokens, i.e. the config cap, with no bug wall below it. Needle-in-haystack verified
+(passphrase at 10% depth, so a PASS means the sparse indexer really selected the right blocks
+across the whole window).
 
-| `--max-model-len` | highest verified prompt | first failure |
-|---|---|---|
-| 1,048,576 | 130,813 | 133,890 |
-| 262,144 | 135,428 | 153,880 |
-| **163,840** | **150,044** | ~157,700 |
+Settings: `DSV4_LOGITS_ROW_CHUNK=128`, `VLLM_PP_LAYER_PARTITION=12,12,12,7`,
+`--gpu-memory-utilization 0.85`. KV pool 4,991,054 tokens (4.76× concurrency at 1M).
 
-**Set `--max-model-len` to roughly 10% above the context you actually need.** Setting it to
-the model's 1,048,576 maximum reduces usable context to ~131k; setting it to 163,840 gets you
-~150k. This is the single highest-leverage knob for long-context work and costs nothing.
+| real prompt tokens | TTFT | prefill tok/s | needle |
+|---|---|---|---|
+| 134,659 | 29.8 s | 4,524 | ✅ ← the old failure point |
+| 292,351 | 77.3 s | 3,781 | ✅ |
+| 538,505 | 178.5 s | 3,017 | ✅ |
+| 769,274 | 304.6 s | 2,525 | ✅ |
+| **1,047,736** | **550.2 s** | **1,904** | ✅ |
 
-Above the ceiling a worker dies with `Xid 31 — MMU Fault ... ACCESS_TYPE_VIRT_WRITE`. The
-fault surfaces in `combine_topk_swa_indices` (`vllm/models/deepseek_v4/amd/rocm.py` — note
-sm_80 runs the **ROCm** Triton path, which the branch author flagged as "more targeted for
-ROCm instead of CUDA"). The surviving pipeline ranks then emit misleading
-`gloo ... Connection closed by peer` errors — **chase the Xid, not the gloo message.**
+Also 4 concurrent 153,891-token prompts, 4/4 correct with no cross-request bleed.
 
-Not simple memory exhaustion: at `--max-model-len 1048576` the KV pool reports **6,921,586
-tokens** and the host had 156 GB of RAM free. But it is memory-*pressure* related — the
-indexer prefill buffer is sized `max_model_len * 40 * 132` bytes, i.e. **5.5 GB/rank at 1M
-versus 1.4 GB at 262k**, which is consistent with the inverse relationship above.
+**Everything the previous version of this document said about the ceiling scaling inversely
+with `--max-model-len` was a symptom of this bug and is withdrawn.** Set `--max-model-len` to
+what you need.
+
+#### The cause
+
+`fp8_mqa_logits_triton` allocates `logits = torch.empty((M, N), torch.float32)` — `M` = tokens
+in the prefill chunk, `N = seq_len / compress_ratio` — and passes the whole buffer to the
+top-k. It grows with context and is the largest allocation on the Triton fallback path (the
+one sm_80 takes because DeepGEMM is unavailable). Above ~134k the worker dies with
+`Xid 31 — MMU Fault ... ACCESS_TYPE_VIRT_WRITE`; the surviving ranks then emit misleading
+`gloo ... Connection closed by peer` — **chase the Xid, not the gloo message.**
+
+**`CUDA_LAUNCH_BLOCKING=1` is what located it**, in one run, after three sessions of code
+reading produced three confident and wrong theories:
+
+```
+attention.py:496                 execute_in_parallel(lambda: indexer(...))
+attention.py:893                 self.indexer_op(hidden_states, q_quant, k, weights)
+sparse_attn_indexer.py:965/592   fp8_mqa_logits_triton(...)
+mqa_logits_triton.py:389         _fp8_mqa_logits_kernel[grid](...)
+RuntimeError: Triton Error [CUDA]: an illegal memory access was encountered
+```
+
+#### The fix — [patch 0006](patches/0006-logits-row-chunk.patch)
+
+Each row's top-k reads only its own `[ks, ke)` window, so **rows are independent** — computing
+them in blocks is exact, not an approximation. `DSV4_LOGITS_ROW_CHUNK=256` reaches ~957,600;
+**1M needs 128**. That the wall moves with the block size confirms the same allocation is still
+the limiter — the chunk is a dial on it, not a cure, and a properly bounded buffer is the right
+upstream fix.
+
+**Cost: none measurable.** Prefill 1,456 vs 1,448 tok/s at 4k. Decode aggregate over 4 runs
+each on the same live server: 82.7 / 83.1 / 98.9 / 110.2 with the fix, 97.9 / 100.7 / 102.3 /
+102.7 without — overlapping, and the patch sits inside `if has_prefill:` so decode is untouched
+by construction.
 
 ### Root-cause attempts that did NOT work — don't repeat these
 
@@ -147,13 +227,25 @@ versus 1.4 GB at 262k**, which is consistent with the inverse relationship above
 | PR **#49897** — torch fallback for `top_k_per_row_prefill` (Python) | no change to the ceiling; cost ~10% prefill |
 | PR **#49139** — radix histogram ring fix (CUDA, needs full rebuild) | no change |
 | PR **#50201** — harden `top_k_per_row` against NaN/under-fill (CUDA) | no change |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | **unusable on these cards** — hard fail at model load: cannot map 20 MB with **28.6 GiB free**. CUDA VMM appears broken on GA100 CMP parts. |
+| `VLLM_PP_LAYER_PARTITION=12,12,12,7` | **did not move the ceiling** — but worth setting anyway: **+85% KV pool** and it removes a real 8.7 GiB rank imbalance |
 
-The radix-threshold theory was seductive and wrong: `RADIX_THRESHOLD = 32768` in
-`csrc/libtorch_stable/persistent_topk.cuh`, and with `compress_ratio 4` that lands at exactly
-131,072 context tokens — matching the original boundary to the token. But applying both radix
-PRs (full CUDA rebuild, `TORCH_CUDA_ARCH_LIST=8.0`) changed nothing, and the later
-`max-model-len` sweep showed the boundary is not fixed at 2¹⁷ at all. **An exact numerical
-coincidence is not a diagnosis.**
+Two theories that fit the evidence beautifully and were both wrong:
+
+**The radix threshold.** `RADIX_THRESHOLD = 32768` in `persistent_topk.cuh`; with
+`compress_ratio 4` that is exactly 131,072 context tokens, matching the original boundary to
+the token. Applying both radix PRs (full CUDA rebuild) changed nothing. It is **not** an
+integer-width bug either — the largest offset the faulting kernel computes at these sizes is
+~7.5e7, three orders of magnitude below 2³¹.
+
+**The starved pipeline rank.** The last PP rank carries `lm_head` *and* the DSpark drafter
+while vLLM sizes the KV pool uniformly, so it ran at **0.09 GiB free versus 8–9 GiB on its
+peers** — and the ceiling correlated cleanly and monotonically with `--gpu-memory-utilization`
+across three values. Rebalancing with `VLLM_PP_LAYER_PARTITION` brought every rank to 6–8 GiB
+free and grew the KV pool 85%, and **the ceiling did not move by one token** — the fault simply
+migrated to PP0, the rank with the *most* free memory, because under pipeline parallelism the
+leading rank reaches the critical `N` first. Memory pressure only decided which rank noticed
+first. **A clean monotonic correlation is not a cause.**
 
 ### Four cards required
 | configuration | result |

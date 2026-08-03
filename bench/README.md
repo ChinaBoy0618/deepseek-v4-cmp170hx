@@ -16,6 +16,8 @@ skip prefill and the numbers are fiction.
 | `bench_decode_stream.py` | decode vs context, by streaming | Timestamps first and last token — no subtraction. Requests `include_usage` and `ignore_eos`; see pitfalls below. |
 | `bench_needle.py` | **correctness** at long context | Buries a passphrase at 10% depth and asks for it back. Tests that the sparse indexer really selects the right blocks — not merely that the run completes. |
 | `bench_probe.py` | deterministic completions to a file | Diff two runs for greedy-equivalence and self-determinism checks. |
+| `bench_ceiling.py` | **the context ceiling**, precisely | Walks a ladder of prompt sizes and separates **PASS / WRONG / DEAD** — DEAD meaning the server stopped answering `/v1/models`, i.e. the worker was killed, which is the Xid-31 signature. Takes `--port` / `--model` rather than editing the file. ⚠️ Its size arguments are **~1.30× the real token count** — read the `real tok` column, which comes from the server's own `usage.prompt_tokens`. |
+| `bench_conc_needle.py` | **correctness under concurrency** at long context | Fires N long needle prompts simultaneously, each with its **own** passphrase, and checks every reply contains its own and no other. A prefill chunk can hold tokens from several requests, so this is what catches row/offset bleed across requests — single-request tests never exercise it. |
 | `bench_decode_ctx.py` | decode vs context by subtraction | **Superseded** by `bench_decode_stream.py` — kept because the failure is instructive. |
 
 ## Pitfalls these encode
