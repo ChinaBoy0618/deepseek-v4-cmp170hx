@@ -3,9 +3,20 @@
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
 
-> ⚠️ **Check out `f8ea5bb` explicitly — do not use the branch tip.** That branch has been
-> force-pushed since these patches were generated, and the hunks will not apply to the new
-> tip. `git checkout f8ea5bb` first. (Reported in
+> ⚠️ **You must check out `f8ea5bb`, and a plain clone will not have it.** The branch was
+> force-pushed after these patches were generated: `f8ea5bb` is no longer reachable from the
+> tip, a `--depth` clone will not contain it, and the server **refuses fetch-by-SHA**.
+> Fetching all refs is what makes it reachable:
+>
+> ```bash
+> git clone --branch dsv4-flash-a100 --single-branch https://github.com/haosdent/vllm.git
+> cd vllm
+> git fetch origin '+refs/*:refs/remotes/all/*'
+> git checkout f8ea5bb
+> ```
+>
+> Verified end to end: from that checkout the seven patches apply in glob order with **zero
+> rejects** and reproduce our live production tree byte-for-byte. (Reported in
 > [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1).)
 
 The container installs vLLM with `pip install -e .`, so `/vllm/vllm/...` inside the image is
