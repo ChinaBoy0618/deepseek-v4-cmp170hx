@@ -5,7 +5,7 @@
 # Usage: run-pp-dspark.sh [--plain]      (--plain = PP4 without DSpark, 50.8 t/s)
 #        run-pp-dspark.sh --maxlen 131072
 #
-# DSpark+PP is NOT supported upstream -- it is enabled by five local patches,
+# DSpark+PP is NOT supported upstream -- it is enabled by seven local patches,
 # applied here by BIND-MOUNT (the image installs vLLM with `pip install -e .`, so
 # /vllm/vllm/... is live code and no rebuild is needed):
 #
@@ -21,7 +21,15 @@
 #   4 v1/worker/gpu/spec_decode/dspark/utils.py  drop NotImplementedError; load the draft's token
 #                                                 embedding from the checkpoint (the target's lives
 #                                                 on PP rank 0, the drafter on the last rank)
-#   5 model_executor/layers/sparse_attn_indexer.py  persistent_topk capability gate (correctness:
+#   5 model_executor/layers/sparse_attn_indexer.py  persistent_topk capability gate (0001;
+#                                                 precautionary, the report was retracted)
+#   6 model_executor/layers/sparse_attn_indexer.py  prefill top-k torch fallback (0005a) --
+#                                                 REQUIRED on sm_80: the CUDA top-k can emit
+#                                                 uninitialised indices and kill a worker with
+#                                                 Xid 31 above ~128k prefill
+#   7 model_executor/layers/sparse_attn_indexer.py  row-chunk the [M,N] logits transient (0006)
+#                                                 -- THE context-ceiling fix, and it is ENV-GATED;
+#                                                 see DSV4_ROW_CHUNK below or it stays inert
 #                                                 silent corruption at prompt len 2049-4096)
 #
 # Why it works at all: for DeepSeek-V4 the DSpark aux-hidden-state taps
@@ -36,7 +44,11 @@ IMG="${DSV4_IMAGE:-dsv4-a100:devel}"
 R="${DSV4_VLLM_SRC:-/opt/vllm-dsv4/vllm}"
 MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
-MAXLEN="${DSV4_MAXLEN:-32768}"    # keep at or below ~128k; see RESULTS.md
+MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
+# Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
+# installed but INERT and you hit the old ~134k wall. 256 reaches ~957k; 128 is needed for
+# the full 1,047,736. Set 0 to reproduce the unpatched upstream path byte-for-byte.
+ROW_CHUNK="${DSV4_ROW_CHUNK:-256}"
 SPEC='--speculative-config {"method":"dspark","num_speculative_tokens":5}'
 
 while [ $# -gt 0 ]; do
@@ -82,6 +94,7 @@ fi
 # shellcheck disable=SC2086
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
   -v "$MODEL":/model \
   $MOUNTS \
   --shm-size=16g -p 8098:8000 \
@@ -91,4 +104,4 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   --gpu-memory-utilization 0.85 --max-num-seqs 8 \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
   $SPEC >/dev/null
-echo "launched dsv4-a100 on :8098  (maxlen $MAXLEN, spec: ${SPEC:-none})"
+echo "launched dsv4-a100 on :8098  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"
