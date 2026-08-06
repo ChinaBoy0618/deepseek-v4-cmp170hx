@@ -52,9 +52,17 @@ This repo sits on top of that branch.
 ## Quick start
 
 ```bash
-git clone --branch dsv4-flash-a100 --single-branch --depth 50 \
+git clone --branch dsv4-flash-a100 --single-branch \
     https://github.com/haosdent/vllm.git
 cd vllm
+
+# The branch was force-pushed after these patches were written, so the tip no
+# longer matches. f8ea5bb is NOT reachable from the branch any more, a --depth
+# clone will not contain it, and the server REFUSES fetch-by-SHA. Fetching all
+# refs is what makes it reachable:
+git fetch origin '+refs/*:refs/remotes/all/*'
+git checkout f8ea5bb
+
 for p in ../deepseek-v4-cmp170hx/patches/*.patch; do patch -p1 < "$p"; done
 
 cp ../deepseek-v4-cmp170hx/docker/Dockerfile.devel .
@@ -163,7 +171,7 @@ driven gains you nothing and risks damaging the contact.
 ## Repo layout
 
 ```
-patches/     5 patches against haosdent/vllm@dsv4-flash-a100 — see patches/README.md
+patches/     7 patches against haosdent/vllm@dsv4-flash-a100 (f8ea5bb) — see patches/README.md
 docker/      container build (CUDA-devel base + venv, precompiled vLLM wheel)
 launch/      run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
 bench/       the 8 harnesses every number in RESULTS.md came from
