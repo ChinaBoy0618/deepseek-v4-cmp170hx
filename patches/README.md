@@ -19,12 +19,12 @@ rebuilding — which is what [`launch/run-pp-dspark.sh`](../launch/run-pp-dspark
 | 0003 | `v1/worker/gpu/pp_utils.py` | add `broadcast_draft()`, the matching receive, and sampled-token padding | This is **vLLM PR #46994**, which is not in upstream main. Without it, non-last pipeline ranks verify against a zero-initialised `req_states.draft_tokens` — acceptance near zero and corrupt output. The padding matters too: the receiver always posts a `max_sample_len`-wide buffer, so an unpadded narrow send is an element-count mismatch that deadlocks. |
 | 0004 | `v1/worker/gpu/model_runner.py` | drop the dspark PP guard; call `broadcast_draft()` after `propose()`; scatter relayed draft tokens on non-last ranks | The guard covered eagle3/dflash/dspark; only dspark is enabled here — the other two are untested and their aux layers are spread across ranks rather than landing on one. |
 | 0005 | `v1/worker/gpu/spec_decode/dspark/utils.py` | drop `NotImplementedError("DSpark does not support pipeline parallelism.")`; add `_has_real_weight()`; load the draft's token embedding from the checkpoint | Under PP the target's `embed_tokens` is a `PPMissingLayer` on the drafter's rank — and **aliasing one is a silent no-op, not an error**, hence the explicit check. The embedding (~1 GB) is read straight from `embed.weight` in the checkpoint, which avoids adding a cross-rank collective to model load. |
+| **0005a** | `model_executor/layers/sparse_attn_indexer.py` **(must precede 0006)** | add `_prefill_topk_needs_torch_fallback()`, `_top_k_per_row_prefill_torch()`, and the prefill `if fallback / else CUDA kernel` branch | ★ **Patches 0001-0006 as first published were INCOMPLETE in two ways.** (1) Those two functions were called at four sites and defined nowhere. (2) 0006 does not *add* the fallback branch — it *rewrites* one, turning `if _prefill_topk_needs_torch_fallback():` into an `elif` and carrying `_top_k_per_row_prefill_torch(` as unchanged context — while the base `f8ea5bb` has a bare unconditional `ops.top_k_per_row_prefill(...)`. So supplying only the definitions is **not** enough. Reported by @fouvy, diagnosed by @snoby in [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1). Named `0005a` so a plain `patches/*.patch` glob applies it before 0006. **The fallback is ACTIVE on sm_80 by design — see below.** |
 | **0006** | `model_executor/layers/sparse_attn_indexer.py` **(stacks on 0001)** | row-chunk the `[M, N]` float32 logits transient, gated by `DSV4_LOGITS_ROW_CHUNK` | ★ **The context-ceiling fix — ~134k → 1,047,736 tokens.** `fp8_mqa_logits_triton` allocates `logits = torch.empty((M, N), float32)` (`M` = prefill-chunk tokens, `N = seq_len / compress_ratio`) and hands the whole buffer to the top-k; it grows with context and is the largest allocation on the Triton fallback path. **Each row's top-k reads only its own `[ks, ke)`, so rows are independent and blocking them is exact, not approximate.** Default-OFF (`0` reproduces upstream byte-for-byte) because it is the same file as 0001 and you may want to bisect them. `256` reaches ~957,600; `128` reaches the full 1M. Costs nothing measurable — prefill 1,456 vs 1,448 tok/s at 4k, and the change is inside `if has_prefill:` so decode cannot be affected. |
-| **0007** | `model_executor/layers/sparse_attn_indexer.py` **(required by 0006)** | define `_prefill_topk_needs_torch_fallback()` and `_top_k_per_row_prefill_torch()` | ★ **Patches 0001-0006 as first published were INCOMPLETE — 0006 calls these two functions at four sites and nothing defined them.** Applying the series to `f8ea5bb` therefore failed, and a tree forced past the rejects raises `NameError` on the first prefill that reaches the top-k. Reported by @fouvy, diagnosed by @snoby in [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1). **The fallback is ACTIVE on sm_80 by design — see below.** |
 
-## ⚠️ The sm_80 prefill top-k fallback is load-bearing — do not stub it out
+## ⚠️ The sm_80 prefill top-k fallback (0005a) is load-bearing — do not stub it out
 
-`_prefill_topk_needs_torch_fallback()` returns **True on sm_80 deliberately**, and patch 0007
+`_prefill_topk_needs_torch_fallback()` returns **True on sm_80 deliberately**, and patch 0005a
 must not be reduced to `return False`.
 
 `ops.top_k_per_row_prefill`'s histogram path (taken by rows with more than `topk_tokens`
@@ -37,11 +37,16 @@ killing a worker on prefills above roughly 128k tokens** (123k passes). Disablin
 fine until you go deep, then kill a worker with no obvious cause.
 
 **This is unrelated to patch 0001.** 0001's `persistent_topk` gate is precautionary and its
-originating report was retracted; **that retraction does not apply to 0007**, which fixes a
+originating report was retracted; **that retraction does not apply to 0005a**, which fixes a
 different bug in a different kernel that we did reproduce on our own cards.
 
 Overrides: `VLLM_DSV4_PREFILL_TOPK_TORCH=0` forces the CUDA kernel back on, `=1` forces the
 fallback on any architecture.
+
+**Verified end to end:** from a pristine checkout of `f8ea5bb`, applying `0001 → 0005a → 0006`
+produces **zero rejects** and reproduces our live in-production file byte-for-byte
+(md5 `96380027dd74c5913b6c4aeca6b25b02`). That check is what should have run before the first
+release, and it is the only reason the second attempt at this fix was caught as incomplete.
 
 **Ordering contract:** the downstream sparse-attention kernels iterate selected KV positions
 in **ascending position order**, whereas `torch.topk` returns *score* order.
