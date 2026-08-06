@@ -3,6 +3,11 @@
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
 
+> ⚠️ **Check out `f8ea5bb` explicitly — do not use the branch tip.** That branch has been
+> force-pushed since these patches were generated, and the hunks will not apply to the new
+> tip. `git checkout f8ea5bb` first. (Reported in
+> [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1).)
+
 The container installs vLLM with `pip install -e .`, so `/vllm/vllm/...` inside the image is
 live source. You can therefore apply these by **bind-mounting the patched files** instead of
 rebuilding — which is what [`launch/run-pp-dspark.sh`](../launch/run-pp-dspark.sh) does.
@@ -15,6 +20,34 @@ rebuilding — which is what [`launch/run-pp-dspark.sh`](../launch/run-pp-dspark
 | 0004 | `v1/worker/gpu/model_runner.py` | drop the dspark PP guard; call `broadcast_draft()` after `propose()`; scatter relayed draft tokens on non-last ranks | The guard covered eagle3/dflash/dspark; only dspark is enabled here — the other two are untested and their aux layers are spread across ranks rather than landing on one. |
 | 0005 | `v1/worker/gpu/spec_decode/dspark/utils.py` | drop `NotImplementedError("DSpark does not support pipeline parallelism.")`; add `_has_real_weight()`; load the draft's token embedding from the checkpoint | Under PP the target's `embed_tokens` is a `PPMissingLayer` on the drafter's rank — and **aliasing one is a silent no-op, not an error**, hence the explicit check. The embedding (~1 GB) is read straight from `embed.weight` in the checkpoint, which avoids adding a cross-rank collective to model load. |
 | **0006** | `model_executor/layers/sparse_attn_indexer.py` **(stacks on 0001)** | row-chunk the `[M, N]` float32 logits transient, gated by `DSV4_LOGITS_ROW_CHUNK` | ★ **The context-ceiling fix — ~134k → 1,047,736 tokens.** `fp8_mqa_logits_triton` allocates `logits = torch.empty((M, N), float32)` (`M` = prefill-chunk tokens, `N = seq_len / compress_ratio`) and hands the whole buffer to the top-k; it grows with context and is the largest allocation on the Triton fallback path. **Each row's top-k reads only its own `[ks, ke)`, so rows are independent and blocking them is exact, not approximate.** Default-OFF (`0` reproduces upstream byte-for-byte) because it is the same file as 0001 and you may want to bisect them. `256` reaches ~957,600; `128` reaches the full 1M. Costs nothing measurable — prefill 1,456 vs 1,448 tok/s at 4k, and the change is inside `if has_prefill:` so decode cannot be affected. |
+| **0007** | `model_executor/layers/sparse_attn_indexer.py` **(required by 0006)** | define `_prefill_topk_needs_torch_fallback()` and `_top_k_per_row_prefill_torch()` | ★ **Patches 0001-0006 as first published were INCOMPLETE — 0006 calls these two functions at four sites and nothing defined them.** Applying the series to `f8ea5bb` therefore failed, and a tree forced past the rejects raises `NameError` on the first prefill that reaches the top-k. Reported by @fouvy, diagnosed by @snoby in [#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1). **The fallback is ACTIVE on sm_80 by design — see below.** |
+
+## ⚠️ The sm_80 prefill top-k fallback is load-bearing — do not stub it out
+
+`_prefill_topk_needs_torch_fallback()` returns **True on sm_80 deliberately**, and patch 0007
+must not be reduced to `return False`.
+
+`ops.top_k_per_row_prefill`'s histogram path (taken by rows with more than `topk_tokens`
+candidates) can leave part of its dynamic-shared-memory output uninitialised and copy it out
+as indices; downstream, `compute_global_topk_indices_and_lens` treats any index `>= 0` as
+valid and dereferences it into the KV block table. Upstream added this torch fallback for
+SM12x in [vllm#49897](https://github.com/vllm-project/vllm/pull/49897); we enable it for SM8x
+too because on 4x CMP 170HX it reproduces as **`Xid 31 MMU Fault ... ACCESS_TYPE_VIRT_WRITE`
+killing a worker on prefills above roughly 128k tokens** (123k passes). Disabling it will look
+fine until you go deep, then kill a worker with no obvious cause.
+
+**This is unrelated to patch 0001.** 0001's `persistent_topk` gate is precautionary and its
+originating report was retracted; **that retraction does not apply to 0007**, which fixes a
+different bug in a different kernel that we did reproduce on our own cards.
+
+Overrides: `VLLM_DSV4_PREFILL_TOPK_TORCH=0` forces the CUDA kernel back on, `=1` forces the
+fallback on any architecture.
+
+**Ordering contract:** the downstream sparse-attention kernels iterate selected KV positions
+in **ascending position order**, whereas `torch.topk` returns *score* order.
+`_top_k_per_row_prefill_torch` sorts accordingly and pads short rows with `-1` at the tail. A
+naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
+indices downstream.
 
 ## Why DSpark-on-PP works at all
 
