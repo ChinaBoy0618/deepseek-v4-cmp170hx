@@ -5,6 +5,14 @@ mining cards — GA100 silicon, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no 
 
 **98 tok/s decode · ~5,300 tok/s prefill · 1,047,736 verified context — the model's full 1M.**
 
+> ⚠️ **If you run long *conversations*, set `DSV4_LOGITS_ROW_CHUNK=64`, not 128.** The 1M figure
+> above is a **single one-shot prefill**. A real accumulating chat on the same config dies at
+> **~718–733k** with a CUDA illegal memory access (reproduced twice). At `64` a 405-turn
+> conversation reached **1,002,852 tokens** clean. See
+> [accumulated vs one-shot](RESULTS.md#accumulated-conversation--one-shot-prefill).
+> Note also that **retrieval accuracy degrades well before any crash** — ~100% at 150k, **~30% at
+> 900k**. The window loads and runs; it is not uniformly usable.
+
 For scale: a single DGX Spark does ~14 tok/s on this class of model, and a dual-Spark setup
 with speculative decoding reports 55–67.
 
@@ -158,6 +166,21 @@ driven gains you nothing and risks damaging the contact.
   ~150k to **1,047,736 tokens**, the model's full 1M. The inverse-scaling advice that used to
   be here was a symptom of that bug and **no longer applies** — set `--max-model-len` to what
   you need. Costs nothing measurable; see [RESULTS](RESULTS.md#-context-ceiling--solved).
+- ★ **An accumulating conversation has a LOWER ceiling than a one-shot prefill, and
+  `DSV4_LOGITS_ROW_CHUNK` moves it.** At `128` a one-shot prefill reaches 1,047,736 but a real
+  multi-turn chat dies at **~718–733k** (CUDA illegal memory access in
+  `_top_k_per_row_prefill_torch`, always on the same PP rank, reproduced twice). At `64` a
+  405-turn chat reached **1,002,852** clean. **Use 64 for conversational workloads.** A one-shot
+  prefill at the same depth is unaffected — this is specific to the prefix-cached path, which
+  needle tests never exercise. See
+  [accumulated vs one-shot](RESULTS.md#accumulated-conversation--one-shot-prefill).
+- ★ **Retrieval accuracy degrades with depth, long before any crash.** Facts planted at known
+  positions and re-queried: **100% at 150k, 87% at 300k, 60% at 450k, 50% at 750k, 30% at 900k.**
+  This is *not* a bug in these patches — chunk size does not change it (identical at matched
+  depth) and no prompt fixes it. `index_topk` is a fixed 512 while the candidate pool grows
+  linearly with context, so the fraction of context reachable falls ~6× from 150k to 900k.
+  **Treat 1M as a large working set, not a reliable database.** Keep retrieval-critical context
+  under ~150k, or re-inject facts that must survive.
 - **Long context is slow, not free.** TTFT at 1M is **9.2 minutes** and decode drops to
   **35.6 tok/s**. Prefill is the expensive half — at the top of its range this is a
   batch/document tool, not an interactive one. Both curves are in

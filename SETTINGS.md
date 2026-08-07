@@ -97,14 +97,26 @@ With `DSV4_LOGITS_ROW_CHUNK` set, the full 1,048,576 works:
 
 | `--max-model-len` | highest verified prompt | `DSV4_LOGITS_ROW_CHUNK` |
 |---|---|---|
-| 393,216 | 388,505 | 256 |
-| **1,048,576** (model max) | **1,047,736** | **128** |
+| 393,216 | 388,505 (one-shot) | 256 |
+| **1,048,576** (model max) | **1,047,736** (one-shot) | **128** |
+| **1,048,576** | **1,002,852** (**405-turn conversation**) | **64** |
+
+⚠️ **Those first two rows are one-shot prefills.** A long *conversation* on `128` dies at
+~718–733k with a CUDA illegal memory access — see
+[accumulated vs one-shot](RESULTS.md#accumulated-conversation--one-shot-prefill). Chunk size costs
+almost nothing (TTFT 7.48 s at `64` vs 7.08 s at `128`, measured at 750k), so **if in doubt use
+64**.
 
 The only reason not to set the maximum is **time**, not capacity: TTFT at 1M is **9.2 minutes**
 and decode drops to ~40 tok/s. Pick the profile that matches your workload —
 
-- everyday, ≤388k → `--max-model-len 393216`, `DSV4_LOGITS_ROW_CHUNK=256`
-- full 1M → `--max-model-len 1048576`, `DSV4_LOGITS_ROW_CHUNK=128`
+- everyday, ≤388k, one-shot documents → `--max-model-len 393216`, `DSV4_LOGITS_ROW_CHUNK=256`
+- full 1M, one-shot documents → `--max-model-len 1048576`, `DSV4_LOGITS_ROW_CHUNK=128`
+- ★ **long conversations / agents (any max-model-len) → `DSV4_LOGITS_ROW_CHUNK=64`**
+
+⚠️ **None of these settings change retrieval accuracy**, which degrades with depth regardless
+(~100% at 150k → ~30% at 900k). That is architectural, not a tuning problem. See
+[RESULTS](RESULTS.md#retrieval-accuracy-vs-depth--the-window-is-reachable-not-uniformly-usable).
 
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
@@ -123,7 +135,7 @@ Standard for this model.
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | Required; fork deadlocks with CUDA already initialised. |
 | `HF_HUB_OFFLINE` | `1` | Local weights only; avoids a hub call on every start. |
 | `CUDA_HOME` | set in image | The devel image sets `/usr/local/cuda`. |
-| **`DSV4_LOGITS_ROW_CHUNK`** | **`256`**, or `128` for 1M | ★ **The context-ceiling fix** ([patch 0006](patches/0006-logits-row-chunk.patch)). Row-chunks the sparse indexer's `[M, N]` float32 logits transient. `0` = original upstream path, which dies at ~134k. `256` reaches ~957,600; `128` reaches the full 1,047,736. Costs nothing measurable. |
+| **`DSV4_LOGITS_ROW_CHUNK`** | **`64`** for conversations; `256`/`128` for one-shot | ★ **The context-ceiling fix** ([patch 0006](patches/0006-logits-row-chunk.patch)). Row-chunks the sparse indexer's `[M, N]` float32 logits transient. `0` = original upstream path, which dies at ~134k. **One-shot prefill:** `256` reaches ~957,600, `128` reaches 1,047,736. **Accumulating conversation:** `128` dies at ~718–733k (reproduced twice); **`64` reached 1,002,852 over 405 turns.** Costs almost nothing (TTFT 7.48 s vs 7.08 s at 750k). Affects only whether it crashes — **not** retrieval accuracy. |
 | **`VLLM_PP_LAYER_PARTITION`** | `12,12,12,7` | Rebalances the 43 layers off pipeline rank 3, which uniquely carries `lm_head` **and** the DSpark drafter. **Does not affect the context ceiling** — but it removes an 8.7 GiB rank imbalance and grows the KV pool **~85%** (798,660 → 1,476,563 at `max-model-len 163840`). Must be 4 entries summing to 43. |
 
 ⚠️ **Do not bother with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — it is a hard

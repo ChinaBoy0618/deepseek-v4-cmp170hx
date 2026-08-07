@@ -46,9 +46,15 @@ MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
 MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
 # Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
-# installed but INERT and you hit the old ~134k wall. 256 reaches ~957k; 128 is needed for
-# the full 1,047,736. Set 0 to reproduce the unpatched upstream path byte-for-byte.
-ROW_CHUNK="${DSV4_ROW_CHUNK:-256}"
+# installed but INERT and you hit the old ~134k wall. Set 0 to reproduce the unpatched
+# upstream path byte-for-byte.
+#
+# ONE-SHOT prefill:  256 reaches ~957k, 128 reaches the full 1,047,736.
+# ACCUMULATING CHAT: 128 dies at ~718-733k with a CUDA illegal memory access (reproduced
+#                    twice); 64 reached 1,002,852 over 405 turns. A one-shot prefill at the
+#                    same depth is fine, so needle tests never catch this.
+# Defaulting to 64: it is the safe value for both, and costs ~5% TTFT at 750k.
+ROW_CHUNK="${DSV4_ROW_CHUNK:-64}"
 SPEC='--speculative-config {"method":"dspark","num_speculative_tokens":5}'
 
 while [ $# -gt 0 ]; do

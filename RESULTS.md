@@ -308,6 +308,94 @@ on an earlier stack. The MXFP4 Marlin path is what faults, so an INT4 checkpoint
 
 ---
 
+## Accumulated conversation ≠ one-shot prefill
+
+Everything above this section — including the 1,047,736 figure — is a **single one-shot prefill
+scored by a single needle**. That tests the prefill path and nothing else. Driving the model the
+way a user does (many turns, prefix cache reusing prior KV, decode at depth) behaves differently.
+
+Harness: a 405-turn conversation over a real mixed corpus (engineering docs / source code / prose),
+prefix caching on, facts planted at known turns and re-queried on a schedule.
+
+### The ceiling is lower, and `DSV4_LOGITS_ROW_CHUNK` moves it
+
+| mode | `ROW_CHUNK` | depth | outcome |
+|---|---|---|---|
+| accumulated chat | 128 | 733,120 | ⛔ CUDA illegal memory access |
+| accumulated chat (repeat) | 128 | 718,216 | ⛔ same fault, same PP rank |
+| one-shot prefill | 128 | 749,534 / 745,427 | ✅ needle hit, clean |
+| one-shot prefill | 128 | 1,047,736 | ✅ |
+| **accumulated chat** | **64** | **1,002,852** | ✅ **405 turns, no crash** |
+
+A one-shot prefill at the *same* depth is fine — and at 1M, with a larger `N`. **So the wall is not
+depth; it is the accumulated / prefix-cached path.** Halving the chunk moved it past 1M, exactly as
+halving 256 → 128 moved the one-shot ceiling.
+
+Fault site, reproduced twice, always the same rank (not the last one):
+
+```
+sparse_attn_indexer.py:618  sparse_attn_indexer
+sparse_attn_indexer.py:164  _top_k_per_row_prefill_torch
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+⚠️ `topk` is the first synchronising op after `fp8_mqa_logits_triton`, so an async fault from that
+kernel would be *reported* here regardless of origin. **`CUDA_LAUNCH_BLOCKING=1` has not yet been
+run**, so treat the exact frame as unconfirmed. Leading hypothesis for why accumulation and not
+one-shot: prefix-cache block reuse fragments the KV block table, and a bad index dereferences out
+of range where a contiguous one-shot table survives. Untested.
+
+**An OOM/IMA leaves the cards unable to create CUDA contexts.** Recover without rebooting:
+`nvidia-smi -r -i <gpu>` then `rmmod nvidia_uvm; modprobe nvidia_uvm`, and re-apply the power cap.
+
+### Retrieval accuracy vs depth — the window is reachable, not uniformly usable
+
+Canary facts planted at known turns, 77 probes:
+
+| context | recall | | context | recall |
+|---|---|---|---|---|
+| 150,000+ | **100%** | | 600,000+ | 86.7% |
+| 300,000+ | 86.7% | | 750,000+ | **50.0%** |
+| 450,000+ | 60.0% | | **900,000+** | **30.0%** |
+
+**This is not caused by these patches.** Recall is statistically identical between `ROW_CHUNK` 128
+and 64 at matched depth (100%/100% at 150k, differences of one probe elsewhere), which is what you
+expect if row-chunking is exact. Chunk size changes only whether it **crashes**, never whether it
+is **right**.
+
+The likely cause is architectural: `index_topk = 512` is fixed while the candidate pool grows
+linearly with context, so the share of context reachable falls from ~1.4% at 150k to ~0.23% at 900k
+— a ~6× reduction against a ~3.3× drop in recall.
+
+**Character of the failures matters more than the rate.** Of 23 misses: **16 returned a different
+real fact from the conversation**, 6 abstained honestly, and **1** invented something. So this is
+retrieval/binding failure, not fabrication — but a confident wrong answer sourced from elsewhere in
+your own documents is arguably worse in practice than an obvious invention. Honest abstention only
+appeared above ~918k, where retrieval returns *nothing*; in the 400–800k band it substitutes
+confidently.
+
+**A grounding/abstention system prompt does not help.** A/B at 118k with canary density doubled to
+force retrieval failure: recall 77.1% vs 79.2% (one probe, noise) and **zero abstentions in either
+arm** — not one substitution converted. The model has no signal that it is failing, so an
+instruction about honesty has nothing to act on.
+
+### Degenerate repetition: rare, and we cannot predict it
+
+Across **1,172 turns** in six runs, **2** outputs degenerated into repetition (`max_rep_8gram` 7–8,
+both stopping only on `max_tokens`) — **0.17%**, at 88,137 and 866,282 tokens.
+
+Both happened to be engineering-doc summaries, which suggested repetitive source content as the
+trigger. **Tested and rejected.** The rate of turns containing any repeated 8-gram: 16.4% vs 6.8%
+(techdoc vs code) at 50–150k, but **12.4% vs 13.5% — reversed** at 300–750k. Depth-matched
+permutation test, n=921: **p = 0.55**. And with 564 techdoc vs 566 code turns in the corpus,
+2-of-2 landing on one type is p = 0.25 by chance — never evidence in the first place.
+
+Mild repetition is normal and content-independent (~10–13% of all turns). Depth does not drive it
+either: within one content type, mean `max_rep_8gram` is 1.20 / 1.09 / 1.20 / 1.15 / 1.17 across
+0 → 750k+. **We have no identified trigger. Do not claim one.**
+
+---
+
 ## Measurement pitfalls found the hard way
 
 Each of these produced a wrong number before it was caught:
@@ -329,3 +417,14 @@ Each of these produced a wrong number before it was caught:
    different configuration.
 7. **A best steady-state window is not a benchmark.** Reporting the fastest 10-second
    logging window gave 3.6×; the honest end-to-end figure over mixed content was 1.9×.
+8. ★ **Verify the access pattern users will actually drive, not just the headline size.** A
+   one-shot prefill and an accumulating conversation are different code paths. This repo
+   published "1M verified" on one-shot needles while a real chat on the same config crashed at
+   ~725k.
+9. ★ **One needle per length is not verification.** Single probes at each depth read 9/9 and
+   looked reliable; repeat-probing found recall at 30% by 900k. Sample enough per depth to see a
+   slope, not just a pass.
+10. ★ **Check the base rate before calling a co-occurrence a pattern.** Two rare events sharing an
+    attribute felt like a lead; the corpus was a 50/50 split, so p = 0.25 by chance. An effect
+    that appears in one stratum and reverses in another is noise — look for replication before
+    reporting.

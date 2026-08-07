@@ -7,6 +7,10 @@ at the top of each if yours differ.
 Start the server with **`--no-enable-prefix-caching`** for any of these, or repeated prompts
 skip prefill and the numbers are fiction.
 
+**One exception:** `bench_chat_accumulate.py` requires prefix caching to be **ON** — reusing prior
+KV across turns is the thing it exists to test, and it is the path where the accumulated-chat
+ceiling lives. Run it against a normally-configured server, not a benchmark one.
+
 | script | measures | notes |
 |---|---|---|
 | `bench_decode3.py` | end-to-end decode over 3 content types | The headline number. Speculative decoding's benefit is content-dependent, so one prompt is not a measurement. |
@@ -19,6 +23,10 @@ skip prefill and the numbers are fiction.
 | `bench_ceiling.py` | **the context ceiling**, precisely | Walks a ladder of prompt sizes and separates **PASS / WRONG / DEAD** — DEAD meaning the server stopped answering `/v1/models`, i.e. the worker was killed, which is the Xid-31 signature. Takes `--port` / `--model` rather than editing the file. ⚠️ Its size arguments are **~1.30× the real token count** — read the `real tok` column, which comes from the server's own `usage.prompt_tokens`. |
 | `bench_conc_needle.py` | **correctness under concurrency** at long context | Fires N long needle prompts simultaneously, each with its **own** passphrase, and checks every reply contains its own and no other. A prefill chunk can hold tokens from several requests, so this is what catches row/offset bleed across requests — single-request tests never exercise it. |
 | `bench_decode_ctx.py` | decode vs context by subtraction | **Superseded** by `bench_decode_stream.py` — kept because the failure is instructive. |
+| `bench_chat_accumulate.py` | ★ **a real multi-turn conversation** — the path every other harness here skips | Many small turns with **prefix caching ON**, growing to 1M. Plants canary facts at known turns and re-queries them on a schedule, so it scores retrieval *and* coherence, not just "did it finish". This is what found the ~725k accumulated-chat ceiling that one-shot needles miss. Needs a corpus directory (`--corpus`); `--grounding` adds an abstention system prompt. ⚠️ The one harness here that must run **with** prefix caching. |
+| `analyze_accum.py` | turns a `bench_chat_accumulate` JSONL into the three answers | Speed shape (TTFT / decode / cache split by depth), coherence (repetition metrics by depth), correctness (canary recall by depth and by how far back the fact was). |
+| `bench_chunk_truth.py` | ★ **whether your token rate is real** | In a *single* request, counts SSE chunks **and** tokenizes the generated text, then compares both to `usage.completion_tokens`. Run this once against any new streaming harness before trusting it — it is how the 3.3–4.6× chunk-counting error was proven rather than argued. |
+| `analyze_content_vs_degen.py` | whether degeneration tracks content or depth | Pools every turn across runs, groups repetition metrics by content type **and** by depth band, and reports the depth-matched comparison. Written to test a hypothesis that it then **falsified** — kept as the template for checking a co-occurrence against its base rate. |
 
 ## Pitfalls these encode
 
