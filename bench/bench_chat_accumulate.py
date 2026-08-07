@@ -91,13 +91,22 @@ def degeneration(text):
 
 
 # ------------------------------------------------------------------ client
-def chat_stream(port, model, messages, max_tokens, timeout, want_logprobs=True):
+def chat_stream(port, model, messages, max_tokens, timeout, want_logprobs=True,
+                think_effort=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens,
             "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True}}
     if want_logprobs:
         body["logprobs"] = True
         body["top_logprobs"] = 1
+    # Per-request thinking, so BOTH arms of an A/B can run against ONE container
+    # with nothing else differing. Top-level `reasoning_effort` is the ambiguous
+    # path (it changes behaviour but /tokenize cannot see it); chat_template_kwargs
+    # is the documented one, and `thinking` alone is not enough -- the effort key
+    # must be present too.
+    if think_effort:
+        body["chat_template_kwargs"] = {"thinking": True,
+                                       "reasoning_effort": think_effort}
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(),
@@ -130,7 +139,11 @@ def chat_stream(port, model, messages, max_tokens, timeout, want_logprobs=True):
                 # against a real ~88. It also means a model looping INSIDE the
                 # think block scores clean unless the reasoning text is fed to
                 # the degeneration metrics -- so capture both.
-                rc = delta.get("reasoning_content")
+                # ★ On DeepSeek-V4-0731 the streamed field is `reasoning`, NOT
+                # `reasoning_content` (per thomaslwang, vllm#50576). Accept both:
+                # reading only the latter silently zeroes every think block and
+                # makes a thinking run look identical to a non-thinking one.
+                rc = delta.get("reasoning") or delta.get("reasoning_content")
                 if rc:
                     if ttft is None:
                         ttft = time.time() - t0
@@ -277,6 +290,13 @@ def main():
     ap.add_argument("--seed", type=int, default=17)
     ap.add_argument("--no-warmup", action="store_true",
                     help="skip warmup so turn 1 measures the COLD server")
+    ap.add_argument("--final-probe-efforts", default=None,
+                    help="comma list of reasoning_effort values. After reaching the "
+                         "budget, re-probe EVERY canary once per value against the "
+                         "SAME conversation -- a paired comparison where context, "
+                         "canaries and history are identical and only effort differs.")
+    ap.add_argument("--think", default=None,
+                    help="reasoning_effort (none|low|high|max); omit for thinking OFF")
     ap.add_argument("--grounding", action="store_true",
                     help="prepend the abstention/grounding system prompt")
     a = ap.parse_args()
@@ -306,7 +326,8 @@ def main():
 
     if not a.no_warmup:
         try:
-            chat_stream(a.port, a.model, [{"role": "user", "content": "hi"}], 8, 120)
+            chat_stream(a.port, a.model, [{"role": "user", "content": "hi"}], 8, 120,
+                        think_effort=a.think)
             print("warmup done (discarded)", flush=True)
         except Exception as e:
             print(f"warmup failed: {e}", flush=True)
@@ -315,7 +336,8 @@ def main():
     canaries = []
     turn = 0
     degen_turn = None
-    print(f"grounding prompt: {'ON' if a.grounding else 'OFF'}", flush=True)
+    print(f"grounding prompt: {'ON' if a.grounding else 'OFF'}  |  "
+          f"thinking: {a.think or 'OFF'}", flush=True)
 
     for kind, fn, body in chunks:
         turn += 1
@@ -333,7 +355,8 @@ def main():
         messages.append({"role": "user", "content": user})
         cache_before = scrape_cache(a.port)
         try:
-            r = chat_stream(a.port, a.model, messages, a.max_tokens, a.timeout)
+            r = chat_stream(a.port, a.model, messages, a.max_tokens, a.timeout,
+                            think_effort=a.think)
         except Exception as e:
             rec = {"turn": turn, "kind": "ERROR", "err": f"{type(e).__name__}: {str(e)[:200]}"}
             fh.write(json.dumps(rec) + "\n")
@@ -381,9 +404,13 @@ def main():
                 c = canaries[ci]
                 probe = messages + [{"role": "user", "content": c["question"]}]
                 try:
-                    # Generous budget: reasoning tokens are billed from the same
-                    # allowance, and at 80 the think block can eat the whole reply.
-                    rr = chat_stream(a.port, a.model, probe, 300, a.timeout)
+                    # ★ Reasoning tokens are billed from the SAME allowance, so with
+                    # thinking on a fixed 300 truncates mid-think and returns EMPTY
+                    # content -- every probe would score a false MISS. Scale the
+                    # probe budget with --max-tokens.
+                    rr = chat_stream(a.port, a.model, probe,
+                                     max(300, a.max_tokens), a.timeout,
+                                     think_effort=a.think)
                 except Exception as e:
                     fh.write(json.dumps({"turn": turn, "kind": "recall_error",
                                          "canary_turn": c["turn"],
@@ -412,6 +439,38 @@ def main():
             print(f"\nreached budget {a.budget_tokens} at turn {turn} (ctx={pt}) - stopping",
                   flush=True)
             break
+
+    # ---- paired final probe: same context, one pass per effort ----
+    if a.final_probe_efforts and canaries:
+        efforts = [e.strip() for e in a.final_probe_efforts.split(",") if e.strip()]
+        print(f"\n=== FINAL PAIRED PROBE: {len(canaries)} canaries x {efforts} ===", flush=True)
+        for eff in efforts:
+            hits = 0
+            for c in canaries:
+                probe = messages + [{"role": "user", "content": c["question"]}]
+                try:
+                    rr = chat_stream(a.port, a.model, probe,
+                                     max(300, a.max_tokens), a.timeout,
+                                     think_effort=eff)
+                except Exception as e:
+                    fh.write(json.dumps({"kind": "final_probe_error", "effort": eff,
+                                         "canary_turn": c["turn"],
+                                         "err": str(e)[:200]}) + "\n")
+                    continue
+                ans = rr["text"].lower()
+                core = re.sub(r"[^0-9]", "", c["value"])
+                hit = (c["value"].lower() in ans) or (bool(core) and core in ans)
+                hits += bool(hit)
+                fh.write(json.dumps({
+                    "kind": "final_probe", "effort": eff, "canary_id": c["id"],
+                    "canary_turn": c["turn"], "ctx": rr.get("prompt_tokens"),
+                    "expected": c["value"], "hit": hit,
+                    "answer": rr["text"][:300],
+                    "reasoning_chars": rr.get("reasoning_chars"),
+                    "completion_tokens": rr.get("completion_tokens"),
+                    "degen": degeneration(rr["text"])}) + "\n")
+            print(f"  effort={eff:5s}  {hits}/{len(canaries)} = "
+                  f"{100*hits/len(canaries):.1f}%", flush=True)
 
     fh.close()
     summary = {"label": a.label, "turns": turn, "canaries": len(canaries),

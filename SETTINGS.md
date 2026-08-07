@@ -118,6 +118,24 @@ and decode drops to ~40 tok/s. Pick the profile that matches your workload —
 (~100% at 150k → ~30% at 900k). That is architectural, not a tuning problem. See
 [RESULTS](RESULTS.md#retrieval-accuracy-vs-depth--the-window-is-reachable-not-uniformly-usable).
 
+### `--reasoning-parser deepseek_v4` — ★ set it even if you never enable thinking
+
+`thinking=False` is the default on 0731, so most people never see this. But the moment thinking is
+on, the `<think>` delimiters are **special tokens** and get stripped on decode — so **without this
+flag the reasoning text arrives inside `content` with nothing marking it as reasoning**, and replies
+literally begin *"We need answer classic. Need be careful. User asks…"*. With the flag it lands in
+its own field and `content` stays a clean answer. The flag is inert when thinking is off, so there
+is no reason not to set it.
+
+⚠️ On this build the returned field is **`reasoning`**, not `reasoning_content`. A client reading
+only the latter sees zero thinking and cannot distinguish a thinking run from a non-thinking one.
+
+**Enabling thinking** (worth it — [+19 points of long-context recall](RESULTS.md#thinking-recovers-a-lot-of-the-lost-long-context-recall--the-effort-level-does-not)):
+per request via `"chat_template_kwargs": {"thinking": true, "reasoning_effort": "high"}`, or
+server-side with `--default-chat-template-kwargs`. **Use `high`, not `max`** — `max` thinks 2.7×
+harder for identical recall. A top-level `reasoning_effort` body param is the ambiguous path; it
+changes behaviour but `/tokenize` cannot see it.
+
 ### `--max-num-seqs 8`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
 winning all the way to 64 concurrent requests on PP.

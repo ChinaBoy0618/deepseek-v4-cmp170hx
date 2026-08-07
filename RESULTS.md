@@ -396,6 +396,70 @@ either: within one content type, mean `max_rep_8gram` is 1.20 / 1.09 / 1.20 / 1.
 
 ---
 
+## Thinking recovers a lot of the lost long-context recall — the effort level does not
+
+`thinking=False` is the default on 0731, so every number above this section — and, I suspect, most
+numbers posted about this model — was measured with thinking **off**.
+
+Matched pair: one container, thinking toggled **per request** via `chat_template_kwargs`, identical
+`max_tokens`, canary density, corpus and depth. Nothing differs but the flag.
+
+| ctx | thinking OFF | thinking ON |
+|---|---|---|
+| 0+ | 82% (14/17) | **100%** (17/17) |
+| 150,000+ | 80% (12/15) | 93% (14/15) |
+| 300,000+ | **27%** (4/15) | **60%** (12/20) |
+| 450,000+ | 50% (5/10) | 60% (3/5) |
+| **overall** | **61.4%** (35/57) | **80.7%** (46/57) |
+
+**Fisher exact p = 0.038**, every bucket improves, and it replicates an earlier independent run
+(81.1% → 96.9%, p = 0.060). It is the only intervention that has moved recall here: chunk size
+changes it not at all at matched depth, and a grounding/abstention system prompt produced **zero**
+abstentions in either arm.
+
+Cost, with both arms on the same generous `max_tokens`: **~2×** generation (630 → 1,227 tokens per
+turn) and decode essentially unchanged (69.1 → 65.3 tok/s). Output also came out **less** repetitive,
+not more (repeated-8gram 29.5% → 18.8%; median distinct-4 0.981 → 0.989).
+
+### The effort level buys nothing — use `high`, not `max`
+
+Paired at **453,845 tokens**, same conversation, same 21 canaries, only `reasoning_effort` differs:
+
+| effort | recall | reasoning chars | completion tokens |
+|---|---|---|---|
+| `high` | **15/21 = 71.4%** | 473 | 111 |
+| `max` | **15/21 = 71.4%** | **1,284 (2.7×)** | **309 (2.8×)** |
+
+Discordance is **2 each way** (McNemar exact p = 1.0). `max` genuinely thought 2.7× harder and
+retrieved exactly as well. Independently consistent with the Terminal-Bench 2.1 result reported in
+[vllm#50576](https://github.com/vllm-project/vllm/issues/50576) (+3/89 tasks for max thinking,
+p = 0.629). **What matters is that the model thinks at all, not how hard you tell it to.**
+
+### Only two effort states are actually reachable
+
+Prompt tokens injected, measured deterministically against `/tokenize`:
+
+| effort | injected |
+|---|---|
+| `low` / `minimal` / `medium` / **`high`** / `none` / no kwargs | **5 (nothing)** |
+| **`max`** / **`xhigh`** | **84** |
+
+The model defines exactly three (`low` is empty, plus `high` and `max` prompts) and asserts
+membership — but on this path `high` injects nothing, i.e. renders identically to `low`. So "thinking
+on at `high`" means *thinking on with no effort prefix*, which is what the table above measured.
+
+### ⚠️ You need `--reasoning-parser deepseek_v4`, or thinking pollutes the answer
+
+The `<think>` delimiters are **special tokens** and are stripped on decode. Without the parser the
+reasoning text arrives inside `content` with nothing marking it — replies literally begin
+*"We need answer classic. Need be careful. User asks…"*. With the parser it lands in its own field
+and `content` stays a clean answer.
+
+⚠️ On this build the returned field is **`reasoning`**, not `reasoning_content`. A client reading
+only the latter silently sees zero thinking and cannot tell a thinking run from a non-thinking one.
+
+---
+
 ## Measurement pitfalls found the hard way
 
 Each of these produced a wrong number before it was caught:
@@ -424,7 +488,14 @@ Each of these produced a wrong number before it was caught:
 9. ★ **One needle per length is not verification.** Single probes at each depth read 9/9 and
    looked reliable; repeat-probing found recall at 30% by 900k. Sample enough per depth to see a
    slope, not just a pass.
-10. ★ **Check the base rate before calling a co-occurrence a pattern.** Two rare events sharing an
+10. ★ **Match the answer budget across arms, or you measure the budget.** An A/B with
+    `max_tokens` 400 on one arm and 3000 on the other (because thinking needs room) produced two
+    wrong conclusions: "thinking makes output 4x more repetitive" and "thinking costs 4x tokens".
+    Rerun with both at 6000 **reversed** the first. If one arm needs a bigger budget to function,
+    raise it for **both**.
+11. ★ **Toggle the treatment per-request against ONE server** where the API allows it, instead of
+    running two servers. Container, weights and cache are then provably identical.
+12. ★ **Check the base rate before calling a co-occurrence a pattern.** Two rare events sharing an
     attribute felt like a lead; the corpus was a 50/50 split, so p = 0.25 by chance. An effect
     that appears in one stratum and reverses in another is noise — look for replication before
     reporting.
