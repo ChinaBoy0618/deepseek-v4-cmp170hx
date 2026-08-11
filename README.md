@@ -46,13 +46,15 @@ This repo sits on top of that branch.
 
 ## Requirements
 
-- **Exactly 4 CMP 170HX** (or other 64 GB sm_80 cards). **3 cards does not work** — it fails
-  in the Marlin MXFP4 expert repack, independent of speculation and memory settings. 2 cards
-  cannot hold 140 GB of weights. See [RESULTS](RESULTS.md#four-cards-required).
+- **3 or 4 CMP 170HX** (or other 64 GB sm_80 cards). Most numbers on this page were taken on 4.
+  **3 cards also works** — you must set `VLLM_PP_LAYER_PARTITION=15,15,13`, because the last
+  pipeline rank also carries `lm_head` and the DSpark drafter. ⚠️ An earlier version of this
+  page said 3 cards could not work; that was **wrong** and is retracted in
+  [RESULTS](RESULTS.md#three-or-four-cards). 2 cards cannot hold ~155 GiB of weights.
 - Cards must be **VRAM-unlocked** — `nvidia-smi` should report 65,536 MiB, not 8,192 MiB.
 - Check the power-brake diagnostic below before benchmarking anything. It is
   motherboard-specific and most people will not hit it, but it costs ~4× if you do.
-- The original `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint (~140 GB on disk). The
+- The original `deepseek-ai/DeepSeek-V4-Flash-0731` checkpoint (**~155.4 GiB / 166.9 GB** on disk; `du` under-reports it as ~140 GB). The
   INT4/compressed-tensors repack is **not** needed; this branch reads the native
   MXFP4+FP8 weights.
 - Docker with the NVIDIA runtime.

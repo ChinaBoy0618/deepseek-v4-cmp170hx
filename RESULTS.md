@@ -290,21 +290,81 @@ without it. If you want to check on your own hardware, flip the `has_device_capa
 term and log `use_persistent_topk` at the selection site; a code read is not sufficient, which
 is the whole lesson here.
 
-### Four cards required
+### Three or four cards
+
+> ⚠️ **RETRACTED 2026-08-09.** This section previously read *"Four cards required"* and stated
+> that 3 cards could not run this model. **That was wrong.** The native MXFP4+FP8 checkpoint
+> runs on 3 cards. The original conclusion was reached without trying the one lever that
+> matters — `VLLM_PP_LAYER_PARTITION` — which this repo already documents, but only ever with a
+> four-entry value.
+
 | configuration | result |
 |---|---|
 | 4 cards | works |
-| 3 cards + DSpark, util 0.90 | illegal memory access in Marlin MXFP4 expert repack |
-| 3 cards, **no** DSpark, util 0.85 | **same failure, same place** |
-| 2 cards | 140 GB of weights does not fit in 127 GB of VRAM |
+| **3 cards + `VLLM_PP_LAYER_PARTITION=15,15,13`** | **works** |
+| 3 cards, default layer split | illegal memory access in Marlin MXFP4 expert repack |
+| 2 cards | ~155 GiB of weights does not fit in ~127 GiB of VRAM |
 
-The 3-card failure is in `marlin_utils_fp4.py:332 _repack_marlin_experts`, during the
-*target* model's load — so it is neither DSpark-related nor a GPU-memory-utilization
-setting. Note pipeline parallel imposes no divisibility requirement (43 layers split fine
-over 3), unlike tensor parallel where 64 heads and 256 experts genuinely cannot divide by 3.
+**The 3-card run, in full:** `deepseek-ai/DeepSeek-V4-Flash-0731` native weights (shard SHA-256s
+verified against the Hub), `--pipeline-parallel-size 3`, `--gpu-memory-utilization 0.95`,
+`--max-model-len 131072`, `--kv-cache-dtype fp8`, DSpark **on** (`num_speculative_tokens 5`),
+`DSV4_LOGITS_ROW_CHUNK=256`, `VLLM_PP_LAYER_PARTITION=15,15,13`. Loads 48/48 shards,
+`GPU KV cache size: 222,408 tokens` (1.70× concurrency), decode ~78.8 tok/s median. Exercised
+with 825 generations plus a 61-turn accumulating conversation to 118,411 tokens — zero errors.
 
-Untested lead: the older INT4 compressed-tensors repack of this model *did* run on 3 cards
-on an earlier stack. The MXFP4 Marlin path is what faults, so an INT4 checkpoint may avoid it.
+**Why the default split fails.** 43 layers over 3 ranks defaults to `[15,14,14]`, and the last
+pipeline rank *additionally* carries `lm_head` and the DSpark drafter. It runs out during the
+target model's expert repack, which is why the traceback lands in
+`marlin_utils_fp4.py:332 _repack_marlin_experts` and reads like a Marlin bug rather than a weight
+**placement** problem. Giving that rank two fewer layers (`15,15,13`) fixes it. This is the same
+reasoning behind the 4-card `12,12,12,7` split already documented in SETTINGS — it was simply
+never applied to a 3-card layout.
+
+The earlier claim that the failure is "independent of ... memory settings" was correct about
+`--gpu-memory-utilization` and wrong in what it concluded: util sizes the **KV pool**, it does not
+move **weights**, so it can never fix a load-time placement failure. Ruling out util does not rule
+out memory — it points at the layer split. Pipeline parallel imposes no divisibility requirement
+(43 splits fine over 3), unlike tensor parallel where 64 heads and 256 experts genuinely cannot.
+
+Also corrected here: the checkpoint is **~155.4 GiB (166.9 GB)**, not ~140 GB — `du` under-reports
+it against the true byte total of 166,886,535,336. The 2-card conclusion is unchanged.
+
+#### 3 cards + the INT4 repack: 512k verified, and a very large KV pool
+
+The old "untested lead" is confirmed too — the INT4 compressed-tensors repack (~150.4 GiB) also
+runs on 3 cards, and it is the better 3-card option if you want context rather than the native
+weights.
+
+| | 3 cards, INT4 repack |
+|---|---|
+| `--max-model-len` | **524,288** (verified serving) |
+| `DSV4_LOGITS_ROW_CHUNK` | **64** |
+| `VLLM_PP_LAYER_PARTITION` | `15,15,13` |
+| `--gpu-memory-utilization` | 0.95 |
+| **GPU KV cache size** | **2,013,978 tokens** |
+| max concurrency at full length | 3.84× |
+| needle retrieval | ✅ correct at **401,532** prompt tokens (174 s cold prefill) |
+| decode, short prompt | ~86 tok/s median |
+
+★ **`DSV4_LOGITS_ROW_CHUNK` buys context, not just crash-safety.** Lowering it shrinks the sparse
+indexer's transient `[M, N]` float32 buffer, and vLLM sizes the KV pool against *profiled peak*
+memory — so that transient is charged against your context budget. Observed on 3 cards:
+
+| row chunk | `--max-model-len` | `--max-num-batched-tokens` | KV pool |
+|---|---|---|---|
+| 256 | 131,072 | 2048 | 506,183 |
+| 128 | 262,144 | 1024 | 1,487,285 |
+| **64** | **524,288** | 1024 | **2,013,978** |
+
+⚠️ These are **not** a clean single-variable sweep — `--max-model-len` and
+`--max-num-batched-tokens` moved too, and the 256 row used the plain INT4 repack while the other
+two used an overlay build of it (same size to within 0.03 GB). The direction is consistent and the
+mechanism is understood, but do not read the exact ratios as attributable to the row chunk alone.
+
+⚠️ **What is NOT claimed:** 1M has **not** been tested on 3 cards. The 2,013,978-token pool
+exceeds 1,048,576 with ~1.9× headroom, so 1M *should* fit — but that is arithmetic, not a
+measurement, and the 1,002,852-token accumulating conversation on this page was run on **4**
+cards. Treat 3-card 1M as expected-but-unverified until someone posts the run.
 
 ---
 

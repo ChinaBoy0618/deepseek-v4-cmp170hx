@@ -149,12 +149,12 @@ Standard for this model.
 
 | var | value | why |
 |---|---|---|
-| `NVIDIA_VISIBLE_DEVICES` | `0,1,2,3` | **All four cards. Three does not work** — see RESULTS. |
+| `NVIDIA_VISIBLE_DEVICES` | `0,1,2,3` | Four cards. **Three also works** (e.g. `1,2,3`) with `VLLM_PP_LAYER_PARTITION=15,15,13` — see [RESULTS](RESULTS.md#three-or-four-cards). An earlier version of this table said three does not work; that was wrong. |
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | Required; fork deadlocks with CUDA already initialised. |
 | `HF_HUB_OFFLINE` | `1` | Local weights only; avoids a hub call on every start. |
 | `CUDA_HOME` | set in image | The devel image sets `/usr/local/cuda`. |
 | **`DSV4_LOGITS_ROW_CHUNK`** | **`64`** for conversations; `256`/`128` for one-shot | ★ **The context-ceiling fix** ([patch 0006](patches/0006-logits-row-chunk.patch)). Row-chunks the sparse indexer's `[M, N]` float32 logits transient. `0` = original upstream path, which dies at ~134k. **One-shot prefill:** `256` reaches ~957,600, `128` reaches 1,047,736. **Accumulating conversation:** `128` dies at ~718–733k (reproduced twice); **`64` reached 1,002,852 over 405 turns.** Costs almost nothing (TTFT 7.48 s vs 7.08 s at 750k). Affects only whether it crashes — **not** retrieval accuracy. |
-| **`VLLM_PP_LAYER_PARTITION`** | `12,12,12,7` | Rebalances the 43 layers off pipeline rank 3, which uniquely carries `lm_head` **and** the DSpark drafter. **Does not affect the context ceiling** — but it removes an 8.7 GiB rank imbalance and grows the KV pool **~85%** (798,660 → 1,476,563 at `max-model-len 163840`). Must be 4 entries summing to 43. |
+| **`VLLM_PP_LAYER_PARTITION`** | `12,12,12,7` (4 cards) · `15,15,13` (3 cards) | Rebalances the 43 layers off pipeline rank 3, which uniquely carries `lm_head` **and** the DSpark drafter. **Does not affect the context ceiling** — but it removes an 8.7 GiB rank imbalance and grows the KV pool **~85%** (798,660 → 1,476,563 at `max-model-len 163840`). Must have one entry per pipeline rank, summing to 43. **On 3 cards this is required, not optional** — the default `[15,14,14]` fails during the Marlin FP4 expert repack because the last rank also carries `lm_head` and the DSpark drafter. |
 
 ⚠️ **Do not bother with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — it is a hard
 failure at model load on these cards: `expandable_segments: memory mapping failed with OOM on
