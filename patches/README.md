@@ -1,5 +1,55 @@
 # Patches
 
+## ★ 2026-08-13: recommended base is now `c3046d1` — patch 0001 is no longer needed
+
+Upstream's 41-commit serving-optimization campaign (base
+`f8ea5bb` → `c3046d1ebd2dae9b94ad2ef5f966ea153632251e`, 2026-08-04) is worth a measured
+**+7% decode (p<0.001)** on this hardware with correctness intact — see
+[RESULTS](../RESULTS.md#rebase-to-c3046d1-2026-08-13), including why the "+30%" you may
+have seen claimed for this range does not survive a paired A/B.
+
+On `c3046d1`:
+
+- **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
+- **`0002 0003 0004 0005 0005a 0006` apply unchanged, zero rejects**, in glob order.
+  (`0005a` must still precede `0006`; the glob order does that.)
+- ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
+  one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
+  `VLLM_USE_PRECOMPILED=1` and the bind-mount method **cannot deliver the kernel changes**.
+  Build from source with [docker/Dockerfile.fullbuild](../docker/Dockerfile.fullbuild)
+  (sm_80-only, ~115 min) with the patches applied to the tree first.
+- New env worth setting: `VLLM_MARLIN_FP8_DEQUANT_BF16=1` (upstream-adopted prefill win,
+  −35 ms TTFT@8k on block-fp8 dense; inert but harmless on the INT4 repack).
+  `VLLM_MARLIN_DENSE_OCCUPANCY` was refuted by its own authors (leave unset), and
+  `VLLM_DSPARK_VOCAB_SHARD` has **zero consumers** at this commit.
+
+### Getting `c3046d1` — it is unreachable by ANY git method
+
+The branch has been force-pushed **again** (tip is now a single squashed commit with newer,
+un-benchmarked work), and this time fetching all refs does not help: `c3046d1` is referenced
+by nothing. GitHub still serves unreachable commits by SHA over HTTP, and the tarball
+reconstructs the exact tree:
+
+```bash
+git clone https://github.com/haosdent/vllm.git && cd vllm
+curl -sL -o /tmp/c3046d1.tar.gz \
+  https://codeload.github.com/haosdent/vllm/tar.gz/c3046d1ebd2dae9b94ad2ef5f966ea153632251e
+mkdir /tmp/c3046d1-src && tar xzf /tmp/c3046d1.tar.gz -C /tmp/c3046d1-src --strip-components=1
+export GIT_INDEX_FILE=/tmp/c3046d1.index
+git read-tree --empty && git --work-tree=/tmp/c3046d1-src add -Af
+git write-tree   # MUST print d13ae12b9a6621ef8d218f53741e59c6db2f68d2 — the upstream tree SHA
+git tag c3046d1-recon "$(git commit-tree d13ae12b9a6621ef8d218f53741e59c6db2f68d2 \
+  -p f8ea5bb163c161ef38b401d055cc5fd4a934091a -m 'c3046d1 reconstructed from tarball')"
+unset GIT_INDEX_FILE && git checkout -B rebase-c3046d1 c3046d1-recon
+```
+
+The `git write-tree` check is the whole safety story: if it prints the upstream tree SHA,
+your working tree is byte-identical to `c3046d1`.
+
+---
+
+## Legacy base `f8ea5bb` (all seven patches)
+
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
 

@@ -20,6 +20,57 @@ request discarded. Harnesses are in [bench/](bench/).
 
 ---
 
+## Rebase to c3046d1 (2026-08-13)
+
+Upstream ran a 41-commit serving-optimization campaign on `dsv4-flash-a100`
+(`f8ea5bb` → `c3046d1`, 2026-08-04). Adopting it on this rig (3× 170HX, PP3, the INT4
+abliterated repack at 524k context) is worth a real but modest **+7% decode**:
+
+| | `f8ea5bb` + 7 patches | `c3046d1` + 6 patches | Δ |
+|---|---|---|---|
+| decode, fixed prompt, token-counted | 86.1 ± 3.3 (n=15) | **92.0 ± 2.8 (n=20)** | **+6.8%, p<0.001** |
+| needle @ 123k / 400k / 492k (94% of window) | verified @401k | **PASS / PASS / PASS** | ✅ |
+| decode at 123k / 400k / 492k depth | — | 95 / 70 / 60 tok/s | known curve |
+| gsm8k / tool-calling | 96.0% / 24 | 95.5% / 24/24 | noise |
+| KV pool @524k maxlen | 2,013,978 | 2,013,136 | −0.04% |
+
+**A "+30%" figure circulated for this range. It does not survive a paired A/B.** It came from
+comparing two *different* benchmark contexts; the campaign's own in-tree record
+(`benchmarks/kernels/dsv4_sm80_refutations.md` — worth reading in full) puts the decode step at
+13.25 → 12.15 ms = **−8.3%**, which is exactly what the paired measurement reproduces. The
+"+48% DSpark acceptance" part of that claim is flat on identical content (tok/chunk 2.49 → 2.50).
+
+Two measurement traps this campaign re-confirmed:
+
+- **A 3-content aggregate at n=1 is not a measurement.** An *unchanged* server swung
+  **101.9 → 130.6 tok/s** across four back-to-back aggregate runs. Judge decode changes on
+  ≥3 aggregate runs or on many fixed-prompt runs; never on one draw.
+- **Sampling temperature (0 vs 0.6) makes no resolvable decode difference** on this stack.
+
+What changed for the patch set and build:
+
+- **`0001` is upstream now; `0002`–`0006` apply with zero rejects** — see
+  [patches/README](patches/README.md#-2026-08-13-recommended-base-is-now-c3046d1--patch-0001-is-no-longer-needed),
+  including how to recover `c3046d1` after upstream's second force-push (tarball + tree-SHA
+  verification; no git method reaches it).
+- **The range touches `csrc/`, so precompiled/bind-mount deployment cannot deliver it.**
+  `libtorch_stable/topk.cu` routes small-batch decode top-k to FilteredTopK below the radix
+  threshold (their measurement: 1.9–3.6× on that kernel) — compiled code. Full source build:
+  [docker/Dockerfile.fullbuild](docker/Dockerfile.fullbuild), sm_80-only, ~115 min.
+- Flags: `VLLM_MARLIN_FP8_DEQUANT_BF16=1` is an upstream-adopted **prefill** win (−35 ms
+  TTFT@8k, block-fp8 dense only). `VLLM_MARLIN_DENSE_OCCUPANCY` is refuted (their own record).
+  `VLLM_DSPARK_VOCAB_SHARD` has zero consumers at `c3046d1`; the adopted
+  `use_local_argmax_reduction` spec-config switch is TP-only (O(2·tp) vs O(vocab) comms —
+  pointless under PP/TP1).
+- The row-chunk context-ceiling fix (`0006` + `DSV4_LOGITS_ROW_CHUNK`) was **not** taken
+  upstream and is still load-bearing above ~134k context.
+
+The branch tip has since been force-pushed again (2026-08-11) to a single squashed commit with
+~11.7k insertions of newer work (DSpark vocab-shard wiring, hierarchical all-reduce, indexer
+query-sharding). Nobody has published numbers for it; these patches will need re-checking there.
+
+---
+
 ## Decode by content type
 
 Speculative decoding's benefit is strongly content-dependent — a single prompt is not a

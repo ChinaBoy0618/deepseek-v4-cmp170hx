@@ -42,6 +42,13 @@ Credit where it's due: the SM8x DeepSeek-V4 backend is
 built on work discussed in [vllm#50576](https://github.com/vllm-project/vllm/issues/50576).
 This repo sits on top of that branch.
 
+> **2026-08-13 — recommended base moved from `f8ea5bb` to `c3046d1`** (+7% decode measured,
+> p<0.001; patch 0001 is now upstream; the range touches `csrc/` so it needs a
+> [full source build](docker/Dockerfile.fullbuild), and the base commit is only recoverable by
+> [tarball](patches/README.md#getting-c3046d1--it-is-unreachable-by-any-git-method) after
+> upstream's second force-push). Details and the honest numbers — including why a circulated
+> "+30%" claim does not reproduce — in [RESULTS](RESULTS.md#rebase-to-c3046d1-2026-08-13).
+
 ---
 
 ## Requirements
