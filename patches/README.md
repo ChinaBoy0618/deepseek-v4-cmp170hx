@@ -383,7 +383,7 @@ self-recover into valid output. A cuts the garbage volume; C' catches the
 degenerate case early. Client-side parse resilience is still the other half
 of the dead-session failure mode.
 
-### 0015 — always-on degenerate tag-soup tripwire (2026-08-19)
+### 0015 — always-on degenerate tag-soup tripwire (2026-08-19, v3)
 
 Trigger: replaying the dead-session context against the 0014 canary
 (30 reqs, 80K prompt, real Bash tool, temp 0.6) reproduced the degeneration
@@ -391,37 +391,42 @@ NATURALLY — 11 tag-soup leaks and one fatal `finish=length`-no-tool-call —
 with **zero** TYPE-B salvage fires and zero guard activations. The dominant
 residual failure is in-context soup imitation, not the salvage path, so the
 0014 post-salvage watch structurally cannot bound it. The replay also showed
-the model emits `<original_output>` (not in the 0014 table) and a fullwidth
-`</｜DSML｜tool_calls>` closer.
+the model emits `<original_output>` (not in the 0014 table).
 
 Changes (scheduler.py only, same dynamic-attribute approach):
-- Signature table += `<original_output`, `｜tool_calls>` (fullwidth bar:
-  matches the hallucinated DSML hybrid close, cannot appear in legit DSML
-  invoke output).
-- `_dsv4_sig_first_ids`: first-token id per signature for a cheap tail
-  prefilter (24-id scan, no tokenizer call in the common case).
-- Always-on tripwire in `_update_request_with_output` after the append
-  loop, **streak semantics**: per-request per-signature counters track how
-  many CONSECUTIVE iterations the signature stays inside the 24-token
-  tail. Fire when any signature holds the tail for
-  `DSV4_SOUP_STREAK` iterations (default 12) -> trim this iteration's
-  burst tokens (cut floored at `_pre_len`, never touches tokens committed
-  by earlier iterations) + FINISHED_STOPPED + resumable=False. Same
-  finish-this-iteration truncation invariant as 0013 TYPE-A / 0014 C'.
-- Why streak, not per-window density: v1 of this patch fired on >=3
-  occurrences in one window — which false-positives on this project's
-  OWN traffic (the agent legitimately writing the signature table into
-  patches/tests produces 4-6 occurrences per window for a few windows).
-  Streak 12 requires the tag to persist >= ~55 output tokens: one-shot
-  listings keep a tag alive ~6-7 windows and survive; real soup (same
-  tag or tag set recurring for 50-300 tokens, both the replay burst
-  style and the dead-session mixed style) always sustains it.
-  `DSV4_SOUP_TRIPWIRE=0` disables.
+- Signature table += `<original_output`. All table entries are tags that
+  CANNOT occur in legitimate output: the DSML tool-call wrapper
+  (`｜DSML｜tool_calls` open/close) is deliberately NOT a signature —
+  v2 of this patch tried a fullwidth `｜tool_calls>` entry and it
+  matched every legitimate tool call, firing 40x in soak (each firing
+  trimmed 1-2 legit wrapper-close tokens). Removed in v3.
+- `_dsv4_sig_first_ids`: first-token id per signature for a cheap
+  prefilter (id scan, no tokenizer call in the common case).
+- Always-on tripwire after the append loop of
+  `_update_request_with_output`, **new-token streak semantics** (v3):
+  the checked window is the tokens appended THIS block plus a 16-token
+  overlap; per-request per-signature counters track CONSECUTIVE blocks
+  whose window contains the signature. Fire when a signature streaks
+  across `DSV4_SOUP_STREAK` iterations (default 12) -> trim this
+  iteration's tokens (cut floored at `_pre_len`) + FINISHED_STOPPED +
+  resumable=False. Same finish-this-iteration truncation invariant as
+  0013 TYPE-A / 0014 C'.
+- Why v3 semantics: (a) per-window density (v1) false-positives on
+  legitimately writing the signature table into patches; (b) a fixed
+  tail window (v2) lets a single legit tag parked at the END of the
+  output hold the window until the streak fires — the new-token window
+  freezes a legit end tag at <=4 while soup (tags in every block for
+  hundreds of tokens) reaches 12. `DSV4_SOUP_TRIPWIRE=0` disables.
+
+Validation: sustained-soup induction fires at exactly streak 12 (trimmed
+6 tokens, FINISHED_STOPPED, clean prefix delivered); tuple-echo of the
+signature table does NOT fire (natural stop, content intact); dead-session
+replay post-0015: 0 fatal / 30, tool calls 30/30, residual 2 short
+self-recovering bursts correctly left untouched.
 
 New log line: `DSV4 0015 soup-tripwire`.
 
-Scope honesty: this converts the fatal burn-the-whole-budget soup case
-into a clean early stop (client sees a normal stopped response and can
-retry/continue), and bounds soup leakage to the streak window (~30-60
-tokens). It does not stop the model from *starting* to imitate soup in
-a poisoned context; that is a context-hygiene problem, not a server bug.
+Scope honesty: converts the fatal burn-the-whole-budget soup case into a
+clean early stop and bounds soup leakage to the streak window (~30-60
+tokens). It does not stop the model from *starting* to imitate soup in a
+poisoned context; that is a context-hygiene problem, not a server bug.
