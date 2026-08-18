@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007 0008` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -114,6 +114,35 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 `_top_k_per_row_prefill_torch` sorts accordingly and pads short rows with `-1` at the tail. A
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
+
+## Spec-decode grammar commit invariant (0009) — port of upstream #52452 + #51870
+
+The principled fix for the class 0008 mitigates: instead of abandoning (or
+killing) after the fact, validate the accepted speculative block BEFORE it is
+committed to request history. Ported verbatim from upstream PRs
+[vllm-project/vllm#52452](https://github.com/vllm-project/vllm/pull/52452)
+(author notes it "fixes problems on ds4 flash") and
+[#51870](https://github.com/vllm-project/vllm/pull/51870), both open at port
+time (2026-08-18).
+
+- `filter_speculative_grammar_tokens()` (52452): locate the reasoning-end
+  boundary inside the block (multi-token markers included), `validate_tokens()`
+  the grammar part, commit only the longest grammar-valid prefix, roll back
+  `num_computed_tokens` / placeholders so the rejected suffix stays schedulable
+  and is resampled under an active mask. Commit invariant: request history and
+  grammar advance through the same longest valid prefix — requests never die
+  AND output stays schema-valid.
+- Quiet post-reasoning draft probes (51870): the `grammar_bitmask` simulation
+  probes drafts with the non-advancing `validate_tokens()` instead of the
+  mutating `accept_tokens()`, so expected rejections neither log nor perturb
+  the matcher.
+
+0008's salvage stays as the last-resort layer for the residual class (model
+degeneration loops that defeat the mask); with 0009 the post-commit rejection
+becomes structurally unreachable in the transition cases. Verified live
+(2026-08-18 14:20): 30x required + 5x json_schema + auto all 200; 37 organic
+requests in the following 25 min with zero FSM errors, zero terminations,
+zero 500s.
 
 ## Grammar salvage (0008) — FSM rejection no longer kills the request
 
