@@ -41,7 +41,7 @@ IMG="${DSV4_IMAGE:-dsv4-a100:devel}"
 # vLLM with `pip install -e .`, so bind-mounting these five files applies the patches
 # with no rebuild. If you applied the patches at build time instead, set
 # DSV4_NO_MOUNT=1 and the mounts are skipped.
-R="${DSV4_VLLM_SRC:-/opt/vllm-dsv4/vllm}"
+R="${DSV4_VLLM_SRC:-/mnt/nvme1/dsv4/vllm-c3046d1/vllm}"
 MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
 MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
@@ -87,7 +87,15 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/worker/gpu/pp_utils.py \
            v1/worker/gpu/model_runner.py \
            v1/worker/gpu/spec_decode/dspark/utils.py \
-           model_executor/layers/sparse_attn_indexer.py; do
+           v1/worker/gpu/spec_decode/dspark/speculator.py \
+           model_executor/layers/sparse_attn_indexer.py \
+           parser/deepseek_v4.py \
+           v1/structured_output/backend_xgrammar.py \
+           v1/structured_output/__init__.py \
+           v1/core/sched/scheduler.py \
+           parser/engine/adapters.py \
+           parser/abstract_parser.py \
+           entrypoints/openai/chat_completion/protocol.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."
@@ -97,17 +105,25 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
   done
 fi
 
+CACHE_DIR="${DSV4_CACHE:-/mnt/nvme1/dsv4/cache}"
+mkdir -p $CACHE_DIR
 # shellcheck disable=SC2086
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
+  -e TRITON_CACHE_DIR=/root/.cache/triton \
+  -v $CACHE_DIR:/root/.cache \
   -v "$MODEL":/model \
   $MOUNTS \
-  --shm-size=16g -p 8098:8000 \
+  --shm-size=16g -p ${DSV4_PORT:-8098}:8000 \
   "$IMG" vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 --kv-cache-dtype fp8 --block-size 256 \
   --max-model-len "$MAXLEN" --max-num-batched-tokens 2048 --trust-remote-code \
   --gpu-memory-utilization 0.85 --max-num-seqs 8 \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --reasoning-parser deepseek_v4 \
+  --default-chat-template-kwargs '{"thinking": true}' \
+  ${DSV4_EXTRA_ARGS:+$DSV4_EXTRA_ARGS} \
   $SPEC >/dev/null
-echo "launched dsv4-a100 on :8098  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"
+echo "launched dsv4-a100 on :${DSV4_PORT:-8098}  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"

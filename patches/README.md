@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011 0012` apply unchanged, zero rejects**, in glob order. (0012 needs the 0007-0011 series present; its scheduler hunks context-match the patched tree.)
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -48,7 +48,7 @@ your working tree is byte-identical to `c3046d1`.
 
 ---
 
-## Legacy base `f8ea5bb` (all seven patches)
+## Legacy base `f8ea5bb` (all eight patches)
 
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
@@ -115,6 +115,113 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
 
+## DSpark OOV sentinel guard (0010) — engine-death belt at the grammar boundary
+
+DSpark can surface its draft-buffer sentinel (id == vocab_size) as a sampled
+token when a degraded draft stream meets an empty grammar row. Committing it
+feeds the sentinel id back into the next forward embedding lookup and kills
+the worker with a device-side assert (2x on 2026-08-18, /v1/messages with
+forced tools). 0010 truncates the block at the first out-of-vocab id, rolls
+the suffix back, and abandons structured enforcement for the request — the
+same salvage policy as 0008, one layer down.
+
+The guard itself first shipped with a latent crash: it read
+model_config.vocab_size, which c3046d1 removed in favor of get_vocab_size();
+the first live trigger AttributeErrored EngineCore dead (2026-08-18 10:52,
+all of /v1/messages went 500 until restart). The patch here carries the
+fixed call — take it, not the pre-fix 760 checkout copy.
+
+## Structural-tag reasoning port (0011) — port of upstream vllm#46149 (closed unmerged)
+
+Upstream _apply_structural_tag hardcodes reasoning=False, so a thinking
+request with a constrained tool_choice gets a grammar that models only the
+tool-call suffix; the FSM then rejects tokens at the reasoning->tool_call
+boundary. Ports all three commits of the PR: _reasoning_enabled() reads the
+per-request reasoner (abstract_parser.py), thinking_enabled is exposed on
+the engine adapter (adapters.py), and _grammar_from_tool_parser=True makes
+enforcement start at token 0 once the tag includes reasoning. Validated
+live 2026-08-18 on dsv4s: 10-arm matrix (OpenAI + Anthropic endpoints x
+forced/required/auto x thinking x stream) plus 35-request unique-prompt
+stress — zero FSM rejections, zero engine deaths.
+## Spec-decode grammar commit invariant (0009) — port of upstream #52452 + #51870
+
+The principled fix for the class 0008 mitigates: instead of abandoning (or
+killing) after the fact, validate the accepted speculative block BEFORE it is
+committed to request history. Ported verbatim from upstream PRs
+[vllm-project/vllm#52452](https://github.com/vllm-project/vllm/pull/52452)
+(author notes it "fixes problems on ds4 flash") and
+[#51870](https://github.com/vllm-project/vllm/pull/51870), both open at port
+time (2026-08-18).
+
+- `filter_speculative_grammar_tokens()` (52452): locate the reasoning-end
+  boundary inside the block (multi-token markers included), `validate_tokens()`
+  the grammar part, commit only the longest grammar-valid prefix, roll back
+  `num_computed_tokens` / placeholders so the rejected suffix stays schedulable
+  and is resampled under an active mask. Commit invariant: request history and
+  grammar advance through the same longest valid prefix — requests never die
+  AND output stays schema-valid.
+- Quiet post-reasoning draft probes (51870): the `grammar_bitmask` simulation
+  probes drafts with the non-advancing `validate_tokens()` instead of the
+  mutating `accept_tokens()`, so expected rejections neither log nor perturb
+  the matcher.
+
+0008's salvage stays as the last-resort layer for the residual class (model
+degeneration loops that defeat the mask); with 0009 the post-commit rejection
+becomes structurally unreachable in the transition cases. Verified live
+(2026-08-18 14:20): 30x required + 5x json_schema + auto all 200; 37 organic
+requests in the following 25 min with zero FSM errors, zero terminations,
+zero 500s.
+
+## Grammar salvage (0008) — FSM rejection no longer kills the request
+
+Under `tool_choice=required` / `response_format` plus DSpark, production hit
+intermittent 500s: `Failed to advance FSM` followed by the scheduler's
+`Unexpected: grammar rejected tokens ... Terminating request`, killing the stream
+mid-response (clients then retried into the same failure — 12 terminations in 80 s).
+Decoding the rejected tokens settles it: `<｜DSML｜tool_calls` envelope fragments
+repeated in a loop, and parameter names with self-invented tags — the checkpoint
+degrading into malformed DSML loops under grammar constraint (same protocol-drift
+root cause as 0007's leak audit). The FSM is *right* to refuse; terminating the
+request is what hurts. The much more frequent "Failed to advance FSM" ERROR lines
+(~60/90 min) are DSpark draft pre-advance noise the baseline already tolerates via
+rollback — the branch tip (12810046) demotes exactly that log to `debug` and
+nothing else, so 0008 ports that verbatim.
+
+What 0008 adds on top of the tip's log demotion: on the scheduler-side rejection,
+instead of `FINISHED_ERROR`, abandon structured-output enforcement for that
+request (`use_structured_output = False`) and let it complete unconstrained. The
+stream survives; 0007's lenient parser can still recover a tool call from the
+degraded output. Restore stock terminating behavior with `DSV4_GRAMMAR_SALVAGE=0`.
+
+Verified live (2026-08-18): 30x `tool_choice=required` + 5x `json_schema` + auto
+all 200 with valid output after deploy; zero FSM ERROR / zero 500 in the window
+after restart. Pure-Python, both files bind-mountable.
+
+## Lenient DSML tool-calls envelope (0007) — parser-side mitigation for long-context protocol drift
+
+Near the context ceiling the Flash checkpoint occasionally degrades its tool-call
+envelope: a well-formed `<｜DSML｜invoke>`/`<｜DSML｜parameter>` body wrapped in
+`<｜DSML｜_tool_calls>` (leading underscore). The stock parser treats that envelope as
+literal text, so the entire call leaks into `content` — the client sees raw protocol
+tags instead of `tool_calls`, and agentic sessions die on it. Observed in production:
+12 leak events in 5 minutes at 143k input tokens (2026-08-18, on the c3046d1
+full-build image); the same responses also contained well-formed calls that parsed
+fine, and a 6-shot replay at 80k tokens reproduced the drift once at temp 0.6 and
+never at temp 0 — model-side probabilistic drift, not a client or parser bug. The
+official encoding README explicitly does not recover malformed output.
+
+`0007` adds `_tool_calls` aliases for the two envelope terminals and mirrors the four
+existing `TOOL_START`/`TOOL_END` state-machine transitions onto them. Nothing else
+changes: the lexer is longest-literal-first, so the official `tool_calls` path is
+byte-identical, and a chunked-stream parity test (the real leaked text fed in 37-char
+slices) produces identical event sequences for both envelopes, ending in
+`TOOL_CALL_END`. Verified live after deploy: parity holds, structured `tool_calls`
+responses unchanged, DSpark acceptance unaffected.
+
+This is a mitigation, not a cure — the drift itself is a checkpoint property. Keep
+accumulated conversations compacted below ~80k tokens (see RESULTS on the
+accumulated-conversation ceiling).
+
 ## Why DSpark-on-PP works at all
 
 The model runner **already** builds the speculator on the last pipeline rank only:
@@ -149,3 +256,35 @@ one that costs an afternoon because its message blames the wrong model:
 1. `v1/worker/gpu/spec_decode/dspark/utils.py` — `NotImplementedError: DSpark does not support pipeline parallelism.`
 2. `v1/worker/gpu/model_runner.py` — `ValueError: {method} with pipeline parallel is not supported.`
 3. `config/model.py` — `NotImplementedError: Pipeline parallelism is not supported for this model. Supported models implement the SupportsPP interface.` This fires at **config** time, on the **draft** architecture, and reads like a problem with the target model.
+
+## Scheduler/worker history desync fix (0012) — root cause of the 2026-08-18 rank-3 deaths
+
+0009/0010 truncated the accepted speculative block on the SCHEDULER side
+only. The worker's input_batch had already committed the full block, so
+every truncation left the two token histories permanently out of sync:
+each later engine step re-sent the suffix, the spec window misaligned, and
+the DSpark drafter eventually read its anchor from a stale slot of the
+preallocated input buffer -- an id >= vocab_size, a device-side assert in
+markov_w1/draft embedding on the drafter PP rank, and EngineDead (2x on
+2026-08-18; /tmp/dsv4-crash-0818-1213.log lines 947-2330). Both upstream
+PRs 0009 ported (#51870, #52452) are still UNMERGED drafts -- no upstream
+fix to inherit; this is ours.
+
+0012 removes every scheduler-side truncation/rollback path instead of
+fixing the arithmetic:
+
+- grammar block: validate-only via filter_speculative_grammar_tokens,
+  then abandon enforcement (0008 salvage semantics) and commit the block
+  unchanged. _kept is deliberately unused -- committing it would recreate
+  the desync.
+- OOV block (0010): keep detection as a tripwire, but finish the request
+  with FINISHED_ERROR and commit nothing. Dropping the block is only safe
+  because the request ends here.
+- speculator.py (new mount): clamp the drafter anchor to
+  [0, get_vocab_size()-1] right after the buffer read, the same hardening
+  the fused Markov kernel already applies to its outputs. A desynced
+  anchor now costs one rejected draft chain, not the worker.
+
+Also worth knowing: the 12:10:46 xgrammar grammar_matcher.cc:612 warnings
+and the acceptance-rate collapse (72% -> 32%) right before the crash were
+the desync already in progress, not a separate grammar bug.
