@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011 0012` apply unchanged, zero rejects**, in glob order. (0012 needs the 0007-0011 series present; its scheduler hunks context-match the patched tree.)
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011 0012 0013` apply unchanged, zero rejects**, in glob order. (0012 needs the 0007-0011 series present; its scheduler hunks context-match the patched tree. 0013 needs 0012 present — it rewrites 0012's grammar block.)
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -288,3 +288,51 @@ fixing the arithmetic:
 Also worth knowing: the 12:10:46 xgrammar grammar_matcher.cc:612 warnings
 and the acceptance-rate collapse (72% -> 32%) right before the crash were
 the desync already in progress, not a separate grammar bug.
+
+## Grammar-rejection bifurcation (0013) — closing the unconstrained-tail leak
+
+0012 made grammar rejections survivable by committing the block unchanged and
+abandoning enforcement. The canary proved the engine survives — but the cost
+surfaced the same night: a Claude Code session (127k input tokens) died when
+the model's output degraded into tag soup; 0012's "abandon enforcement" let
+the garbage tail stream unconstrained and the client's tool-call parse
+failed. Forensics + upstream triage (#43338 reports the same bleed class)
+split grammar rejections into two kinds with different correct handling:
+
+- **TYPE-A — FSM terminated inside the block.** The rejected suffix is
+  post-completion garbage (the grammar already emitted its full valid
+  output). 0013 keeps the valid prefix, commits it, and finishes the request
+  (FINISHED_STOPPED). The request leaves the running set in the same
+  iteration, so no future spec window can consume the scheduler/worker
+  divergence — the same invariant that makes the stock stop-truncation
+  (`del new_token_ids[num_new:]`) safe. This is a repair, not just a
+  mitigation: the client receives complete schema-valid output.
+
+- **TYPE-B — FSM still live.** Mid-stream violation, exactly what 0008's
+  salvage was built for (long-context DSML degradation). Behavior unchanged
+  from 0012; the only addition is a distinct "TYPE-B" log line so the real
+  prevalence becomes measurable before any further tightening.
+
+Mechanics:
+
+- `backend_xgrammar.py`: new `validate_tokens_ex(tokens) -> (prefix,
+  terminated)` — like `validate_tokens`, but breaks at FSM termination and
+  reports it. The entry `_is_terminated` guard plus breaking *before*
+  offering the next token also removes this path's grammar_matcher.cc:612
+  warnings. (The #37506-style `_is_terminated` sync in `accept_tokens`'
+  failure path was already present in this tree.)
+- `__init__.py`: `filter_speculative_grammar_tokens` now returns a 3-tuple
+  `(kept, rejected, terminated)`; backends without `validate_tokens_ex`
+  report `terminated=False` and keep 0012 semantics.
+- `scheduler.py`: the TYPE-A truncation happens before the commit, but the
+  explicit FINISHED_STOPPED is applied *after* `_update_request_with_output`
+  returns (stock `check_stop` owns `stopped`/truncation inside that call).
+  An empty valid prefix finishes immediately, mirroring the 0012 OOV block.
+
+Note for porters: this fork has **no** stock `is_terminated` → finish hook —
+`__init__.py` only stops masking/advancing after termination, so requests
+decode unconstrained to EOS/max_tokens. That is why 0013 must finish
+explicitly. Upstream faces the same trade (current main kills such requests
+via the accept-failure path instead of bleeding prefixes, per #43338); a
+clean truncate-and-finish does not exist upstream as of 2026-08-18
+(#52452/#51870/#37506 all open, zero merges in this family).
