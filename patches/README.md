@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -115,6 +115,34 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
 
+## DSpark OOV sentinel guard (0010) — engine-death belt at the grammar boundary
+
+DSpark can surface its draft-buffer sentinel (id == vocab_size) as a sampled
+token when a degraded draft stream meets an empty grammar row. Committing it
+feeds the sentinel id back into the next forward embedding lookup and kills
+the worker with a device-side assert (2x on 2026-08-18, /v1/messages with
+forced tools). 0010 truncates the block at the first out-of-vocab id, rolls
+the suffix back, and abandons structured enforcement for the request — the
+same salvage policy as 0008, one layer down.
+
+The guard itself first shipped with a latent crash: it read
+model_config.vocab_size, which c3046d1 removed in favor of get_vocab_size();
+the first live trigger AttributeErrored EngineCore dead (2026-08-18 10:52,
+all of /v1/messages went 500 until restart). The patch here carries the
+fixed call — take it, not the pre-fix 760 checkout copy.
+
+## Structural-tag reasoning port (0011) — port of upstream vllm#46149 (closed unmerged)
+
+Upstream _apply_structural_tag hardcodes reasoning=False, so a thinking
+request with a constrained tool_choice gets a grammar that models only the
+tool-call suffix; the FSM then rejects tokens at the reasoning->tool_call
+boundary. Ports all three commits of the PR: _reasoning_enabled() reads the
+per-request reasoner (abstract_parser.py), thinking_enabled is exposed on
+the engine adapter (adapters.py), and _grammar_from_tool_parser=True makes
+enforcement start at token 0 once the tag includes reasoning. Validated
+live 2026-08-18 on dsv4s: 10-arm matrix (OpenAI + Anthropic endpoints x
+forced/required/auto x thinking x stream) plus 35-request unique-prompt
+stress — zero FSM rejections, zero engine deaths.
 ## Spec-decode grammar commit invariant (0009) — port of upstream #52452 + #51870
 
 The principled fix for the class 0008 mitigates: instead of abandoning (or
