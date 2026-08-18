@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -48,7 +48,7 @@ your working tree is byte-identical to `c3046d1`.
 
 ---
 
-## Legacy base `f8ea5bb` (all seven patches)
+## Legacy base `f8ea5bb` (all eight patches)
 
 Against [haosdent/vllm@dsv4-flash-a100](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)
 (commit `f8ea5bb`). Apply with `patch -p1` from the vLLM checkout root.
@@ -114,6 +114,31 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 `_top_k_per_row_prefill_torch` sorts accordingly and pads short rows with `-1` at the tail. A
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
+
+## Lenient DSML tool-calls envelope (0007) — parser-side mitigation for long-context protocol drift
+
+Near the context ceiling the Flash checkpoint occasionally degrades its tool-call
+envelope: a well-formed `<｜DSML｜invoke>`/`<｜DSML｜parameter>` body wrapped in
+`<｜DSML｜_tool_calls>` (leading underscore). The stock parser treats that envelope as
+literal text, so the entire call leaks into `content` — the client sees raw protocol
+tags instead of `tool_calls`, and agentic sessions die on it. Observed in production:
+12 leak events in 5 minutes at 143k input tokens (2026-08-18, on the c3046d1
+full-build image); the same responses also contained well-formed calls that parsed
+fine, and a 6-shot replay at 80k tokens reproduced the drift once at temp 0.6 and
+never at temp 0 — model-side probabilistic drift, not a client or parser bug. The
+official encoding README explicitly does not recover malformed output.
+
+`0007` adds `_tool_calls` aliases for the two envelope terminals and mirrors the four
+existing `TOOL_START`/`TOOL_END` state-machine transitions onto them. Nothing else
+changes: the lexer is longest-literal-first, so the official `tool_calls` path is
+byte-identical, and a chunked-stream parity test (the real leaked text fed in 37-char
+slices) produces identical event sequences for both envelopes, ending in
+`TOOL_CALL_END`. Verified live after deploy: parity holds, structured `tool_calls`
+responses unchanged, DSpark acceptance unaffected.
+
+This is a mitigation, not a cure — the drift itself is a checkpoint property. Keep
+accumulated conversations compacted below ~80k tokens (see RESULTS on the
+accumulated-conversation ceiling).
 
 ## Why DSpark-on-PP works at all
 

@@ -1,0 +1,73 @@
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -49,6 +49,15 @@
+ DSML_INVOKE_END = f"</{_DSML}invoke>"
+ DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+ 
++# Lenient envelope variants: the Flash checkpoint occasionally emits a
++# leading underscore in the tool-calls envelope when output degrades in
++# long contexts (observed "<｜DSML｜_tool_calls>" with a
++# well-formed invoke/parameter body inside; the official encoding README
++# states parsers do not recover malformed output). These aliases keep
++# such calls parseable instead of leaking them as plain content.
++DSML_TOOL_START_LENIENT = f"<{_DSML}_tool_calls>"
++DSML_TOOL_END_LENIENT = f"</{_DSML}_tool_calls>"
++
+ _ESCAPED_DSML = re.escape(_DSML)
+ _PARAM_RE = re.compile(
+     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+@@ -131,6 +140,8 @@
+             "THINK_END": DSML_THINK_END,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
++            "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
++            "TOOL_END_LENIENT": DSML_TOOL_END_LENIENT,
+             "INVOKE_PREFIX": DSML_INVOKE_PREFIX,
+             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
+             "INVOKE_END": DSML_INVOKE_END,
+@@ -141,6 +152,8 @@
+             "THINK_END": DSML_THINK_END,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
++            "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
++            "TOOL_END_LENIENT": DSML_TOOL_END_LENIENT,
+         },
+         transitions={
+             (ParserState.CONTENT, "THINK_START"): Transition(
+@@ -170,6 +183,14 @@
+                 ParserState.TOOL_PREAMBLE,
+                 (),
+             ),
++            (ParserState.REASONING, "TOOL_START_LENIENT"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (EventType.REASONING_END,),
++            ),
++            (ParserState.CONTENT, "TOOL_START_LENIENT"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (),
++            ),
+             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+@@ -186,6 +207,10 @@
+                 ParserState.CONTENT,
+                 (EventType.TOOL_CALL_END,),
+             ),
++            (ParserState.TOOL_ARGS, "TOOL_END_LENIENT"): Transition(
++                ParserState.CONTENT,
++                (EventType.TOOL_CALL_END,),
++            ),
+             # Parallel tool calls
+             (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+@@ -195,6 +220,10 @@
+                 ParserState.CONTENT,
+                 (),
+             ),
++            (ParserState.TOOL_BETWEEN, "TOOL_END_LENIENT"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
+         },
+         content_events={
+             ParserState.CONTENT: EventType.TEXT_CHUNK,
