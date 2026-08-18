@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8098/v1/completions"
+URL = "http://127.0.0.1:5700/v1/completions"
 MODEL = "dsv4s"
 
 WORDS = (
