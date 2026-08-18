@@ -1,0 +1,98 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ /mnt/nvme1/dsv4/vllm-c3046d1/vllm/v1/core/sched/scheduler.py	2026-08-19 01:57:05.766442079 +0800
+@@ -84,6 +84,8 @@
+         "text_placeholder",
+         "<edit-path",
+         "<source>placeholder",
++        "<original_output",
++        "｜tool_calls>",
+     )
+ 
+     def __init__(
+@@ -130,6 +132,30 @@
+         else:
+             self._dsv4_sig_cutback = 0
+ 
++        # DSV4 0015: first-token ids of every signature, for the cheap
++        # tail prefilter (scan 24 ids against a set before decoding).
++        if _tok is not None:
++            self._dsv4_sig_first_ids = frozenset(
++                _ids[0]
++                for _ids in (
++                    _tok.encode(s, add_special_tokens=False)
++                    for s in self._DSV4_SIG_STRINGS
++                )
++                if _ids
++            )
++        else:
++            self._dsv4_sig_first_ids = frozenset()
++        # DSV4 0015: always-on degenerate tag-soup tripwire. The dead
++        # session AND the 2026-08-19 replay showed soup imitation with
++        # zero grammar-salvage involvement, so the 0014 post-salvage
++        # watch alone cannot bound it. DSV4_SOUP_TRIPWIRE=0 disables,
++        # DSV4_SOUP_MINHITS sets the per-window burst threshold.
++        self._dsv4_soup_enabled = (
++            os.environ.get("DSV4_SOUP_TRIPWIRE", "1") != "0"
++            and bool(self._dsv4_sig_first_ids)
++        )
++        self._dsv4_soup_minhits = int(os.environ.get("DSV4_SOUP_MINHITS", "3"))
++
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+         # by update_from_outputs(). This is currently used in the multi-engine
+@@ -2318,6 +2344,19 @@
+         _tail = _tok.decode(request._output_token_ids[-24:])
+         return any(_s in _tail for _s in self._DSV4_SIG_STRINGS)
+ 
++    def _dsv4_soup_count(self, request: Request) -> int:
++        """DSV4 0015: number of signature occurrences in the decoded
++        24-token tail. First-token prefilter keeps the common case at a
++        24-element id scan with no tokenizer call."""
++        _tail_ids = request._output_token_ids[-24:]
++        if not any(_t in self._dsv4_sig_first_ids for _t in _tail_ids):
++            return 0
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return 0
++        _tail = _tok.decode(_tail_ids)
++        return sum(_tail.count(_s) for _s in self._DSV4_SIG_STRINGS)
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2393,6 +2432,35 @@
+             if stopped:
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
++        # DSV4 0015: always-on degenerate tag-soup tripwire. Bursts
++        # reach >=3 signature occurrences inside one 24-token window;
++        # legitimate text quoting a tag once or twice cannot. Uses the
++        # same finish-this-iteration truncation invariant as 0013
++        # TYPE-A and 0014 C' (never touches tokens committed before
++        # this iteration: the cut is floored at _pre_len).
++        if not stopped and self._dsv4_soup_enabled:
++            _hits = self._dsv4_soup_count(request)
++            if _hits >= self._dsv4_soup_minhits:
++                _out = request._output_token_ids
++                _cut = max(_pre_len, len(_out) - self._dsv4_sig_cutback)
++                _removed = len(_out) - _cut
++                if _removed > 0:
++                    del _out[_cut:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _cut:
++                    ]
++                    del new_token_ids[max(0, _cut - _pre_len):]
++                logger.warning(
++                    "DSV4 0015 soup-tripwire for request %s: %s signature "
++                    "hits in tail, trimmed %s tokens, finishing "
++                    "FINISHED_STOPPED.",
++                    request.request_id,
++                    _hits,
++                    _removed,
++                )
++                request.status = RequestStatus.FINISHED_STOPPED
++                request.resumable = False
++                return new_token_ids, True
+         return new_token_ids, stopped
+ 
+     def _free_encoder_inputs(self, request: Request) -> None:
