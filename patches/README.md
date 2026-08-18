@@ -336,3 +336,49 @@ explicitly. Upstream faces the same trade (current main kills such requests
 via the accept-failure path instead of bleeding prefixes, per #43338); a
 clean truncate-and-finish does not exist upstream as of 2026-08-18
 (#52452/#51870/#37506 all open, zero merges in this family).
+
+## Post-salvage damage guard (0014) — bounding the TYPE-B unconstrained tail
+
+0013 closed the TYPE-A leak; TYPE-B keeps 0012 salvage semantics (commit
+unchanged, abandon enforcement). The remaining cost of that safety choice is
+the **unconstrained tail**: after salvage fires, the request generates
+grammar-free until EOS/stop/max_tokens. The 2026-08-18 dead-session
+post-mortem (14:50-15:05Z window in `dsv4-run-0012canary-final.log`: 16
+salvage fires, all TYPE-B "1-2 of 3-6 tokens rejected", 75 salvage / 0
+crashes over the full run) showed what that tail looks like under long
+context: the model emits hallucinated control-tag soup (`<reference>`,
+`<tool_calls>`, `<｜DSML｜invoke … string="false">`, `<text_placeholder>`,
+`<dies_cmd_wrapper>` …) and the client-side tool-call parse dies.
+
+0014 bounds exactly that tail, nothing else. Two mechanisms, armed together
+at the (single, per-request) salvage point:
+
+- **A — token budget.** `DSV4_SALVAGE_TOKEN_BUDGET` (default 64; negative
+  disables). Post-salvage tokens decrement the budget; exhaustion finishes
+  the request FINISHED_STOPPED with stock-stop semantics (committed tokens
+  stay). Caps the damage window regardless of what the model does.
+- **C' — degenerate-signature watch.** After each post-salvage token, the
+  last 24 output tokens are decoded and matched against
+  `_DSV4_SIG_STRINGS` — only markers that cannot occur in legitimate
+  structured output (the DSML invoke special token itself is deliberately
+  excluded). On hit, the in-flight signature tokens are trimmed (both
+  `_output_token_ids` and `_all_token_ids`, prompt-offset aware) and the
+  request finishes. Decode-based matching, not id-sequence matching, so
+  context-dependent tokenization cannot evade it. `DSV4_SALVAGE_GUARD=0`
+  disables.
+
+Safety argument for the C' trim: the request finishes in the same iteration
+(status set inside `_update_request_with_output`, mirroring `check_stop`),
+so no later spec window ever observes the cut — the same invariant as the
+stock stop truncation and 0013 TYPE-A. `Request` has no `__slots__`, so the
+guard state attaches as dynamic attributes; no `request.py` change, no new
+mounted file.
+
+New log lines (distinct for measurement): `DSV4 0014 salvage-guard armed`,
+`DSV4 0014 salvage-cap hit`, `DSV4 0014 degenerate-signature`.
+
+Honest scope note: this is damage *bounding*, not a repair. Of 75 observed
+salvage fires only ~1 produced client-visible failure — most tails
+self-recover into valid output. A cuts the garbage volume; C' catches the
+degenerate case early. Client-side parse resilience is still the other half
+of the dead-session failure mode.
