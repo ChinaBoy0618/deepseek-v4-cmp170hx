@@ -430,3 +430,30 @@ Scope honesty: converts the fatal burn-the-whole-budget soup case into a
 clean early stop and bounds soup leakage to the streak window (~30-60
 tokens). It does not stop the model from *starting* to imitate soup in a
 poisoned context; that is a context-hygiene problem, not a server bug.
+
+### 0016 — draft-window FSM overfeed elimination (2026-08-19, round-1 fix)
+
+Trigger: the R1 context-size matrix (4.7K -> 285K prompt tokens, 4 arms,
+60/60 client-pass) still logged `grammar_matcher.cc:612` ("matcher has
+terminated ... trying to accept new token id 1") before nearly every
+0013 TYPE-A line. Root cause: the stock draft-filter sites
+(`scheduler.py update_draft_token_ids` / `update_draft_token_ids_in_output`)
+validate the WHOLE draft block with the old `validate_tokens`, which keeps
+offering tokens after the FSM accepted its stop token mid-block; the
+backend `accept_tokens` inner loop had the same hole. Harmless to output
+(0013 truncates at commit) but one C++ warning + wasted matcher work per
+tool-call request.
+
+Changes:
+- `backend_xgrammar.py accept_tokens`: break the loop as soon as the FSM
+  accepts its stop token — post-stop tokens are definitionally garbage.
+- `scheduler.py` both draft-filter sites: probe with `validate_tokens_ex`
+  (termination-aware, same accept+rollback semantics) when available,
+  falling back to stock `validate_tokens` on other backends.
+
+Expected effect: 612 warnings ~0 on normal tool-call traffic; TYPE-A
+truncations unchanged (that is the correct commit-time mechanism).
+
+Validation (0016 canary): ctx matrix 60/60, hammer 200/200, 612 count 0,
+TYPE-A still present and correct, induced-soup tripwire still fires,
+tuple-echo still passes.
