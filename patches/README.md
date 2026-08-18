@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011 0012` apply unchanged, zero rejects**, in glob order. (0012 needs the 0007-0011 series present; its scheduler hunks context-match the patched tree.)
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -256,3 +256,35 @@ one that costs an afternoon because its message blames the wrong model:
 1. `v1/worker/gpu/spec_decode/dspark/utils.py` — `NotImplementedError: DSpark does not support pipeline parallelism.`
 2. `v1/worker/gpu/model_runner.py` — `ValueError: {method} with pipeline parallel is not supported.`
 3. `config/model.py` — `NotImplementedError: Pipeline parallelism is not supported for this model. Supported models implement the SupportsPP interface.` This fires at **config** time, on the **draft** architecture, and reads like a problem with the target model.
+
+## Scheduler/worker history desync fix (0012) — root cause of the 2026-08-18 rank-3 deaths
+
+0009/0010 truncated the accepted speculative block on the SCHEDULER side
+only. The worker's input_batch had already committed the full block, so
+every truncation left the two token histories permanently out of sync:
+each later engine step re-sent the suffix, the spec window misaligned, and
+the DSpark drafter eventually read its anchor from a stale slot of the
+preallocated input buffer -- an id >= vocab_size, a device-side assert in
+markov_w1/draft embedding on the drafter PP rank, and EngineDead (2x on
+2026-08-18; /tmp/dsv4-crash-0818-1213.log lines 947-2330). Both upstream
+PRs 0009 ported (#51870, #52452) are still UNMERGED drafts -- no upstream
+fix to inherit; this is ours.
+
+0012 removes every scheduler-side truncation/rollback path instead of
+fixing the arithmetic:
+
+- grammar block: validate-only via filter_speculative_grammar_tokens,
+  then abandon enforcement (0008 salvage semantics) and commit the block
+  unchanged. _kept is deliberately unused -- committing it would recreate
+  the desync.
+- OOV block (0010): keep detection as a tripwire, but finish the request
+  with FINISHED_ERROR and commit nothing. Dropping the block is only safe
+  because the request ends here.
+- speculator.py (new mount): clamp the drafter anchor to
+  [0, get_vocab_size()-1] right after the buffer read, the same hardening
+  the fused Markov kernel already applies to its outputs. A desynced
+  anchor now costs one rejected draft chain, not the worker.
+
+Also worth knowing: the 12:10:46 xgrammar grammar_matcher.cc:612 warnings
+and the acceptance-rate collapse (72% -> 32%) right before the crash were
+the desync already in progress, not a separate grammar bug.
