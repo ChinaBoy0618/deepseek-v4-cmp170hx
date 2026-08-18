@@ -1,0 +1,57 @@
+--- a/vllm/v1/core/sched/scheduler.py	2026-08-19 04:19:33.746014425 +0800
++++ b/vllm/v1/core/sched/scheduler.py	2026-08-19 04:19:33.746133930 +0800
+@@ -2535,7 +2535,18 @@
+             # Add newly generated spec token ids to the request.
+             if self.structured_output_manager.should_advance(request):
+                 metadata = request.structured_output_request
+-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
++                # DSV4 0016: probe with the termination-aware variant so a
++                # draft block that contains the FSM stop token mid-block
++                # does not keep feeding tokens to a terminated matcher
++                # (grammar_matcher.cc:612). Same rollback semantics as the
++                # stock validate_tokens.
++                _probe = getattr(metadata.grammar, "validate_tokens_ex", None)
++                if _probe is not None:
++                    spec_token_ids, _term = _probe(spec_token_ids)
++                else:
++                    spec_token_ids = metadata.grammar.validate_tokens(
++                        spec_token_ids
++                    )  # type: ignore[union-attr]
+             request.spec_token_ids = spec_token_ids
+ 
+     def update_draft_token_ids_in_output(
+@@ -2564,7 +2575,18 @@
+             # Filter out spec tokens which do not adhere to the grammar.
+             if self.structured_output_manager.should_advance(request):
+                 metadata = request.structured_output_request
+-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
++                # DSV4 0016: probe with the termination-aware variant so a
++                # draft block that contains the FSM stop token mid-block
++                # does not keep feeding tokens to a terminated matcher
++                # (grammar_matcher.cc:612). Same rollback semantics as the
++                # stock validate_tokens.
++                _probe = getattr(metadata.grammar, "validate_tokens_ex", None)
++                if _probe is not None:
++                    spec_token_ids, _term = _probe(spec_token_ids)
++                else:
++                    spec_token_ids = metadata.grammar.validate_tokens(
++                        spec_token_ids
++                    )  # type: ignore[union-attr]
+             # Pad to original number of spec tokens.
+             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
+             if num_invalid_tokens:
+--- a/vllm/v1/structured_output/backend_xgrammar.py	2026-08-19 04:19:33.736133956 +0800
++++ b/vllm/v1/structured_output/backend_xgrammar.py	2026-08-19 04:19:33.736986133 +0800
+@@ -173,6 +173,12 @@
+                 )
+                 return False
+             self.num_processed_tokens += 1
++            # DSV4 0016: once the FSM accepts its stop token, tokens
++            # after it are post-termination garbage; offering them to
++            # the matcher is what emits grammar_matcher.cc:612.
++            if self.matcher.is_terminated():
++                self._is_terminated = True
++                break
+         self._is_terminated = self.matcher.is_terminated()
+         return True
+ 
