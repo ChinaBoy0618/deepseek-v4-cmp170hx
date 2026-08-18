@@ -121,7 +121,10 @@ def main():
         bad = None
         if sig:
             bad = "SIG:" + ",".join(sig[:3])
-        elif finish == "length" and not tcs:
+        elif finish == "length" and not tcs and len(txt) < 200:
+            # length-burn with near-empty text = the dead-session soup
+            # burn signature; a long text hitting max_tokens is a legit
+            # answer and is not a tool-call failure.
             bad = "LENGTH_BURN(no tool call)"
         elif tcs:
             for tc in tcs:
