@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008` apply unchanged, zero rejects**, in glob order.
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -114,6 +114,31 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 `_top_k_per_row_prefill_torch` sorts accordingly and pads short rows with `-1` at the tail. A
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
+
+## Grammar salvage (0008) — FSM rejection no longer kills the request
+
+Under `tool_choice=required` / `response_format` plus DSpark, production hit
+intermittent 500s: `Failed to advance FSM` followed by the scheduler's
+`Unexpected: grammar rejected tokens ... Terminating request`, killing the stream
+mid-response (clients then retried into the same failure — 12 terminations in 80 s).
+Decoding the rejected tokens settles it: `<｜DSML｜tool_calls` envelope fragments
+repeated in a loop, and parameter names with self-invented tags — the checkpoint
+degrading into malformed DSML loops under grammar constraint (same protocol-drift
+root cause as 0007's leak audit). The FSM is *right* to refuse; terminating the
+request is what hurts. The much more frequent "Failed to advance FSM" ERROR lines
+(~60/90 min) are DSpark draft pre-advance noise the baseline already tolerates via
+rollback — the branch tip (12810046) demotes exactly that log to `debug` and
+nothing else, so 0008 ports that verbatim.
+
+What 0008 adds on top of the tip's log demotion: on the scheduler-side rejection,
+instead of `FINISHED_ERROR`, abandon structured-output enforcement for that
+request (`use_structured_output = False`) and let it complete unconstrained. The
+stream survives; 0007's lenient parser can still recover a tool call from the
+degraded output. Restore stock terminating behavior with `DSV4_GRAMMAR_SALVAGE=0`.
+
+Verified live (2026-08-18): 30x `tool_choice=required` + 5x `json_schema` + auto
+all 200 with valid output after deploy; zero FSM ERROR / zero 500 in the window
+after restart. Pure-Python, both files bind-mountable.
 
 ## Lenient DSML tool-calls envelope (0007) — parser-side mitigation for long-context protocol drift
 

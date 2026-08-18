@@ -88,7 +88,9 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/worker/gpu/model_runner.py \
            v1/worker/gpu/spec_decode/dspark/utils.py \
            model_executor/layers/sparse_attn_indexer.py \
-           parser/deepseek_v4.py; do
+           parser/deepseek_v4.py \
+           v1/structured_output/backend_xgrammar.py \
+           v1/core/sched/scheduler.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."
