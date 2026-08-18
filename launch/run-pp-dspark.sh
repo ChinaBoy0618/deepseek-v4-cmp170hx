@@ -36,7 +36,7 @@
 # (dspark_target_layer_ids = [40,41,42] of 43 layers) AND lm_head both land on the
 # last PP rank, which is where the model runner already builds the drafter.
 # ---- configure these three for your machine -----------------------------------
-IMG="${DSV4_IMAGE:-dsv4-a100:devel}"
+IMG="${DSV4_IMAGE:-dsv4-a100-fullbuild:devel}"
 # VLLM_SRC: the vllm/ package directory of your PATCHED checkout. The image installs
 # vLLM with `pip install -e .`, so bind-mounting these five files applies the patches
 # with no rebuild. If you applied the patches at build time instead, set
