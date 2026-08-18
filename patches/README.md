@@ -382,3 +382,38 @@ salvage fires only ~1 produced client-visible failure — most tails
 self-recover into valid output. A cuts the garbage volume; C' catches the
 degenerate case early. Client-side parse resilience is still the other half
 of the dead-session failure mode.
+
+### 0015 — always-on degenerate tag-soup tripwire (2026-08-19)
+
+Trigger: replaying the dead-session context against the 0014 canary
+(30 reqs, 80K prompt, real Bash tool, temp 0.6) reproduced the degeneration
+NATURALLY — 11 tag-soup leaks and one fatal `finish=length`-no-tool-call —
+with **zero** TYPE-B salvage fires and zero guard activations. The dominant
+residual failure is in-context soup imitation, not the salvage path, so the
+0014 post-salvage watch structurally cannot bound it. The replay also showed
+the model emits `<original_output>` (not in the 0014 table) and a fullwidth
+`</｜DSML｜tool_calls>` closer.
+
+Changes (scheduler.py only, same dynamic-attribute approach):
+- Signature table += `<original_output`, `｜tool_calls>` (fullwidth bar:
+  matches the hallucinated DSML hybrid close, cannot appear in legit DSML
+  invoke output).
+- `_dsv4_sig_first_ids`: first-token id per signature for a cheap tail
+  prefilter (24-id scan, no tokenizer call in the common case).
+- Always-on tripwire in `_update_request_with_output` after the append
+  loop: `>= DSV4_SOUP_MINHITS` (default 3) signature occurrences within
+  one 24-token tail window -> trim this iteration's burst tokens (cut
+  floored at `_pre_len`, never touches tokens committed by earlier
+  iterations) + FINISHED_STOPPED + resumable=False. Same finish-this-
+  iteration truncation invariant as 0013 TYPE-A / 0014 C'.
+- Threshold rationale: soup bursts are 4+ occurrences per 24 tokens;
+  legitimate text quoting a tag once or twice cannot reach 3 in one
+  window. `DSV4_SOUP_TRIPWIRE=0` disables.
+
+New log line: `DSV4 0015 soup-tripwire`.
+
+Scope honesty: this converts the fatal burn-the-whole-budget soup case
+into a clean early stop (client sees a normal stopped response and can
+retry/continue), and bounds soup leakage to ~1 burst window (~24-30
+tokens). It does not stop the model from *starting* to imitate soup in
+a poisoned context; that is a context-hygiene problem, not a server bug.
