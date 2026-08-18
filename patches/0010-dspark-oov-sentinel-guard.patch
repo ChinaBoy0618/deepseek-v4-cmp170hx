@@ -1,0 +1,85 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1795,6 +1795,40 @@
+             stopped = False
+             new_logprobs = None
+             new_token_ids = generated_token_ids
++            # DSV4 0010: DSpark can surface its draft-buffer sentinel
++            # (id == vocab_size) as a sampled token when a degraded draft
++            # stream meets an empty grammar row. Committing it feeds the id
++            # back into the next forward's embedding lookup -> CUDA
++            # device-side assert -> engine death (2x 2026-08-18). Truncate
++            # at the first out-of-vocab id, roll back the suffix, and drop
++            # structured enforcement for this request.
++            vocab_size = self.vllm_config.model_config.get_vocab_size()
++            oov_idx = next(
++                (i for i, t in enumerate(new_token_ids) if t >= vocab_size),
++                None,
++            )
++            if oov_idx is not None:
++                logger.warning(
++                    "Out-of-vocab token %s (vocab_size=%s) in output of "
++                    "request %s; truncating %s-token block at position %s"
++                    " and abandoning structured-output enforcement.",
++                    new_token_ids[oov_idx],
++                    vocab_size,
++                    req_id,
++                    len(new_token_ids),
++                    oov_idx,
++                )
++                request.structured_output_request = None
++                oov_rejected = len(new_token_ids) - oov_idx
++                new_token_ids = new_token_ids[:oov_idx]
++                if request.num_computed_tokens > 0:
++                    request.num_computed_tokens -= oov_rejected
++                if request.num_output_placeholders > 0:
++                    request.num_output_placeholders -= oov_rejected
++                num_accepted -= max(
++                    oov_rejected - self.num_sampled_tokens_per_step, 0
++                )
++                assert num_accepted >= 0
+             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+             kv_transfer_params = None
+             ec_transfer_params = None
+@@ -1803,7 +1837,7 @@
+             num_output_tokens_before = len(request._output_token_ids)
+ 
+             if (
+-                len(new_token_ids) > 1
++                new_token_ids
+                 and scheduled_spec_token_ids
+                 and request.use_structured_output
+                 and not output_is_stale
+@@ -1826,6 +1860,21 @@
+                         0,
+                     )
+                     assert num_accepted >= 0
++                    if not new_token_ids:
++                        # Entire block violates the grammar (e.g. the FSM
++                        # terminated and the sampler produced no valid
++                        # continuation). Committing nothing and resampling
++                        # every step would spin until max_tokens; drop
++                        # enforcement and let the request finish
++                        # unconstrained (0008 salvage semantics).
++                        logger.warning(
++                            "All %s speculative tokens rejected by grammar "
++                            "for request %s; abandoning structured-output "
++                            "enforcement.",
++                            num_grammar_rejected,
++                            req_id,
++                        )
++                        request.structured_output_request = None
+ 
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -1896,7 +1945,9 @@
+                             advance_token_ids,
+                             req_id,
+                         )
+-                        request.use_structured_output = False
++                        # read-only property; None flips it False and
++                        # exits the bitmask/advance paths (audited None-safe)
++                        request.structured_output_request = None
+ 
+             routed_experts = None
+             if (
