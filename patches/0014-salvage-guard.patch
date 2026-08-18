@@ -1,0 +1,180 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -68,6 +68,24 @@
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # DSV4 0014 C': hallucinated control-tag signatures observed in the
++    # 2026-08-18 dead session (unconstrained post-salvage tail emitting
++    # mixed XML/DSML tag soup). Deliberately excludes any string that
++    # can occur in legitimate structured output (e.g. the DSML invoke
++    # special token itself).
++    _DSV4_SIG_STRINGS = (
++        "<reference",
++        "<tool_calls",
++        "<tool-call-name",
++        "<dies_cmd_wrapper",
++        "<empty-tool-call",
++        "<original_code_end",
++        "<commit_begin",
++        "text_placeholder",
++        "<edit-path",
++        "<source>placeholder",
++    )
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -96,6 +114,22 @@
+         self.structured_output_manager = structured_output_manager
+         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+ 
++        # DSV4 0014 C': how many trailing tokens to cut when a signature
++        # fires (longest signature's token length + tokenization slack).
++        # Zero (watch inert) when the tokenizer is unavailable -- but
++        # then no grammar work exists either, so salvage cannot fire.
++        _tok = getattr(structured_output_manager, "tokenizer", None)
++        if _tok is not None:
++            self._dsv4_sig_cutback = (
++                max(
++                    len(_tok.encode(s, add_special_tokens=False))
++                    for s in self._DSV4_SIG_STRINGS
++                )
++                + 2
++            )
++        else:
++            self._dsv4_sig_cutback = 0
++
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+         # by update_from_outputs(). This is currently used in the multi-engine
+@@ -1901,6 +1935,44 @@
+                         )
+                         # read-only property: the next line flips use_structured_output
+                         request.structured_output_request = None
++                        # DSV4 0014: bound the unconstrained tail this
++                        # just opened. Salvage fires at most once per
++                        # request (the property flip above gates the
++                        # FSM check), so the guard is armed exactly
++                        # here:
++                        #   A) a token budget so the tail cannot run
++                        #      to max_tokens (DSV4_SALVAGE_TOKEN_BUDGET,
++                        #      default 64; negative disables);
++                        #   C') a degenerate-signature watch that
++                        #      finishes the request the moment the
++                        #      model starts emitting hallucinated
++                        #      control tags (DSV4_SALVAGE_GUARD=0
++                        #      disables).
++                        # Fields attach dynamically (Request has no
++                        # __slots__); _update_request_with_output reads
++                        # them via getattr defaults.
++                        try:
++                            _budget = int(
++                                os.environ.get(
++                                    "DSV4_SALVAGE_TOKEN_BUDGET", "64"
++                                )
++                            )
++                        except ValueError:
++                            _budget = 64
++                        request._dsv4_post_salvage_budget = (
++                            _budget if _budget >= 0 else None
++                        )
++                        request._dsv4_sig_watch = (
++                            os.environ.get("DSV4_SALVAGE_GUARD", "1") != "0"
++                            and self._dsv4_sig_cutback > 0
++                        )
++                        logger.info(
++                            "DSV4 0014 salvage-guard armed for request %s "
++                            "(budget=%s, sig_watch=%s)",
++                            req_id,
++                            _budget,
++                            request._dsv4_sig_watch,
++                        )
+ 
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -2236,6 +2308,16 @@
+         self._enqueue_waiting_request(request)
+         return False
+ 
++    def _dsv4_signature_hit(self, request: Request) -> bool:
++        """DSV4 0014 C': does the decoded output tail contain a
++        hallucinated control-tag signature? Decode (not id-sequence
++        matching) so context-dependent tokenization cannot evade it."""
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return False
++        _tail = _tok.decode(request._output_token_ids[-24:])
++        return any(_s in _tail for _s in self._DSV4_SIG_STRINGS)
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2244,9 +2326,67 @@
+         # a request is still being prefilled, we expect the model runner
+         # to return empty token ids for the request.
+         stopped = False
++        # DSV4 0014 A/C': post-salvage guard state captured once per
++        # block; both stay inert for every non-salvaged request.
++        _guard_armed = (
++            getattr(request, "_dsv4_post_salvage_budget", None) is not None
++            or getattr(request, "_dsv4_sig_watch", False)
++        )
++        _pre_len = len(request._output_token_ids)
+         for num_new, output_token_id in enumerate(new_token_ids, 1):
+             request.append_output_token_ids(output_token_id)
+ 
++            if _guard_armed:
++                # DSV4 0014-A: budget exhausted -> finish with
++                # stock-stop semantics (committed tokens stay, no
++                # further tokens). May preempt min_tokens; that guard
++                #                 exists to stop early EOS, not server-side damage
++                #                 control on an already off-constraint request.
++                _budget = getattr(request, "_dsv4_post_salvage_budget", None)
++                if _budget is not None:
++                    _budget -= 1
++                    request._dsv4_post_salvage_budget = _budget
++                    if _budget < 0:
++                        logger.warning(
++                            "DSV4 0014 salvage-cap hit for request %s: "
++                            "finishing FINISHED_STOPPED after the "
++                            "post-salvage budget.",
++                            request.request_id,
++                        )
++                        request.status = RequestStatus.FINISHED_STOPPED
++                        request.resumable = False
++                        del new_token_ids[num_new:]
++                        return new_token_ids, True
++                # DSV4 0014-C': hallucinated control tag in the decoded
++                # tail -> trim the in-flight signature tokens and
++                # finish. The request ends this iteration, so no later
++                # spec window observes the cut (the same invariant as
++                # the stock stop truncation and 0013 TYPE-A).
++                if (
++                    getattr(request, "_dsv4_sig_watch", False)
++                    and self._dsv4_signature_hit(request)
++                ):
++                    _out = request._output_token_ids
++                    _cut = max(
++                        _pre_len, len(_out) - self._dsv4_sig_cutback
++                    )
++                    _removed = len(_out) - _cut
++                    del _out[_cut:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _cut:
++                    ]
++                    del new_token_ids[max(0, _cut - _pre_len):]
++                    logger.warning(
++                        "DSV4 0014 degenerate-signature for request %s: "
++                        "trimmed %s tail tokens, finishing "
++                        "FINISHED_STOPPED.",
++                        request.request_id,
++                        _removed,
++                    )
++                    request.status = RequestStatus.FINISHED_STOPPED
++                    request.resumable = False
++                    return new_token_ids, True
++
+             # Check for stop and update request state.
+             # This must be called before we make the EngineCoreOutput.
+             stopped = check_stop(request, self.max_model_len)
