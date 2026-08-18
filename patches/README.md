@@ -401,19 +401,27 @@ Changes (scheduler.py only, same dynamic-attribute approach):
 - `_dsv4_sig_first_ids`: first-token id per signature for a cheap tail
   prefilter (24-id scan, no tokenizer call in the common case).
 - Always-on tripwire in `_update_request_with_output` after the append
-  loop: `>= DSV4_SOUP_MINHITS` (default 3) signature occurrences within
-  one 24-token tail window -> trim this iteration's burst tokens (cut
-  floored at `_pre_len`, never touches tokens committed by earlier
-  iterations) + FINISHED_STOPPED + resumable=False. Same finish-this-
-  iteration truncation invariant as 0013 TYPE-A / 0014 C'.
-- Threshold rationale: soup bursts are 4+ occurrences per 24 tokens;
-  legitimate text quoting a tag once or twice cannot reach 3 in one
-  window. `DSV4_SOUP_TRIPWIRE=0` disables.
+  loop, **streak semantics**: per-request per-signature counters track how
+  many CONSECUTIVE iterations the signature stays inside the 24-token
+  tail. Fire when any signature holds the tail for
+  `DSV4_SOUP_STREAK` iterations (default 12) -> trim this iteration's
+  burst tokens (cut floored at `_pre_len`, never touches tokens committed
+  by earlier iterations) + FINISHED_STOPPED + resumable=False. Same
+  finish-this-iteration truncation invariant as 0013 TYPE-A / 0014 C'.
+- Why streak, not per-window density: v1 of this patch fired on >=3
+  occurrences in one window — which false-positives on this project's
+  OWN traffic (the agent legitimately writing the signature table into
+  patches/tests produces 4-6 occurrences per window for a few windows).
+  Streak 12 requires the tag to persist >= ~55 output tokens: one-shot
+  listings keep a tag alive ~6-7 windows and survive; real soup (same
+  tag or tag set recurring for 50-300 tokens, both the replay burst
+  style and the dead-session mixed style) always sustains it.
+  `DSV4_SOUP_TRIPWIRE=0` disables.
 
 New log line: `DSV4 0015 soup-tripwire`.
 
 Scope honesty: this converts the fatal burn-the-whole-budget soup case
 into a clean early stop (client sees a normal stopped response and can
-retry/continue), and bounds soup leakage to ~1 burst window (~24-30
+retry/continue), and bounds soup leakage to the streak window (~30-60
 tokens). It does not stop the model from *starting* to imitate soup in
 a poisoned context; that is a context-hygiene problem, not a server bug.
