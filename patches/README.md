@@ -585,3 +585,31 @@ Results on the 0017v2+0018+0019 stack:
   zero crash. Classified stochastic residual of the known drafter hole;
   hammer 200/200 re-verified post-restart. Hardening (worker-side clamp)
   stays on the 0012 backlog as 0020 candidate if it recurs.
+
+### 0020 — verify-output vocab clamp (2026-08-19 late, user-approved)
+
+Root path of the 11:42 crash, established by reading the verify pipeline:
+the OOB id (== vocab_size) leaves the DSpark **verify kernel** —
+`rejection_sample()`'s `sampled` (accepted+bonus tokens) — and the worker
+commits it to req_state *before* the scheduler's 0010 guard can react, so
+the NEXT step's embedding lookup device-asserts on every PP rank. The 0012
+clamp covers only the drafter's anchor read; the verify OUTPUT was the
+remaining unguarded surface.
+
+- `rejection_sampler.py`: `_dsv4_vocab_limit` in `__init__`
+  (`sampler.sampling_states.vocab_size - 1`); in `_verify`,
+  `sampled.clamp_(min=0, max=limit)` immediately after `rejection_sample`
+  returns and BEFORE the logprobs flatten reads it. In-place, no GPU sync,
+  capture-safe. A leak now degrades ONE token silently instead of killing
+  the engine. Note: with 0020 active, the 0010 scheduler guard should
+  never fire again (OOB never leaves the worker).
+- `launch/run-pp-dspark.sh`: `rejection_sampler.py` added to the
+  bind-mount list (was not mounted — host patch did not reach the
+  container until recreate); default MODEL path fixed to
+  `/mnt/data/DeepSeek-V4-Flash-0731` (the old `/models/...` default is an
+  empty dir; a relaunch without DSV4_MODEL died at startup).
+- TDD: `bench/tdd_0020.py` — drives the REAL `_verify` + REAL `__call__`
+  plumbing with only the Triton `rejection_sample` faked to leak the
+  sentinel at the crash shape. V01/V02/V03/V05 RED on unpatched, GREEN
+  after; V04 (clean ids never over-clamped) green before and after;
+  tdd_0017/0019/0019v2 regressions green in the recreated container.

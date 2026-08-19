@@ -21,6 +21,7 @@ Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 | 0019 | line-repetition tripwire | scheduler.py | short-line >=5x streak-6 -> FINISHED_STOPPED (issue-2 Lets reload.x60); DSV4_REPETITION_TRIPWIRE / DSV4_REP_STREAK / DSV4_SOUP_TOTAL knobs |
 | 0017v2 | soup cumulative totals | scheduler.py | fire on streak>=12 OR total>=DSV4_SOUP_TOTAL(18); sparse pseudo-tag leakage (live-TDD finding) |
 | 0019v2 | repetition window floor | scheduler.py | max(new+16, DSV4_REP_WINDOW=160) — 21-token window could never hold 5 occurrences at spec=5 block sizes (live-TDD finding) |
+| 0020 | verify-output vocab clamp | rejection_sampler.py (+launch mount) | sampled.clamp_ after rejection_sample — OOB sentinel degrades one token instead of PP-wide embedding assert; closes the 0819-1142 crash path |
 
 Backups on this tree: *.bak-<patch#> beside each patched file
 (scheduler.py.bak-0019v2 / deepseek_v4.py.bak-0018 are the immediate rollback points;
