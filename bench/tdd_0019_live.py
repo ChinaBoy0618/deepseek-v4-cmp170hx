@@ -79,7 +79,12 @@ if MODE in ("probe", "all"):
                       "messages": [{"role": "user", "content": p}]})
             c = r["choices"][0]
             txt = c["message"]["content"] or ""
-            good = c["finish_reason"] in ("stop", "length") and len(txt) > 60
+            # shape-based (length probes misfire on legitimately short answers)
+            shape = [("|" in txt and "---" in txt),
+                     ("一" in txt and "十" in txt
+                      and len([l for l in txt.splitlines() if l.strip()]) >= 8),
+                     ("for" in txt and "hello" in txt and "print" in txt)][i]
+            good = c["finish_reason"] in ("stop", "length") and shape
             ok += good
             print(f"probe{i}: {'OK ' if good else 'BAD'} fin={c['finish_reason']} len={len(txt)}")
         except Exception as e:

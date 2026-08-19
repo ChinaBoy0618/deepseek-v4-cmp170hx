@@ -543,3 +543,45 @@ Table hits with zero fires.
 - Apply order note: 0017 -> 0018 -> 0019 -> 0017v2 (v2 was written after
   0019 on the live tree; patch boundaries follow the backup chain
   `.bak-0019`/`.bak-0017v2`).
+
+### 0019v2 — repetition window floor (2026-08-19, live-TDD finding)
+
+Same lesson as 0017v1, found in the issue-2 replay: `_dsv4_rep_lines` used
+the 0015-style window (`new_token_ids + 16` overlap ~= 21 tokens at spec=5).
+A repeated short line is ~4-6 tokens, so 5 occurrences need 25-30 tokens —
+and the sliding window boundary truncates one occurrence mid-line, capping
+the count at 4. Unit suite was green (big blocks) but the tripwire was DEAD
+in production: i2 replay produced dup>=5 responses with zero fires.
+
+- `scheduler.py`: window floor `max(new+16, DSV4_REP_WINDOW=160)` so the
+  count sees a stable trailing region; streak-6 rule unchanged. Legit
+  parked duplicates stop firing as soon as the line scrolls out (same
+  semantics as 0015 soup window).
+- TDD: `tdd_0019v2.py` — W02 (exact live shape: 5-token decode blocks,
+  consecutive repeats fire) RED on v1, GREEN after; W03-W07 guards (3-4
+  sparse/interleaved mentions, separators, long lines, table rows) stay
+  green before AND after.
+
+### Issue-replay validation + crash incident (2026-08-19 11:42)
+
+User-directed verbatim replay (`bench/tdd_issue_replay.py`): issue-1
+pseudo-tag transcript and issue-2 Lets-reload loop through the live
+service at temp 1.0.
+
+Results on the 0017v2+0018+0019 stack:
+- think_leak = 0 everywhere (0018 strip works live, incl. tools group).
+- 0017v2 cumulative soup fired twice correctly (`</assistant>` total 18,
+  `<answer>` total 18; trimmed 2-3 tokens, FINISHED_STOPPED).
+- **Crash 11:42:26** during i1 round 1 request #11: `Out-of-vocab token
+  129280 (=vocab_size)` — the 0010 guard firing for the FIRST time in
+  container history — then PP3 (drafter rank) CUDA device-side assert ->
+  EngineDead, container exit. Same class as the 08-18 crash (degraded
+  DSpark draft stream surfaces the sentinel token; scheduler guard errors
+  the request but the worker-side embedding lookup is already in flight).
+  None of the 0017-0019 fire paths executed near the crash; they touch
+  neither drafter nor sampler. Full log: 760:/tmp/dsv4-crash-0819-1142.log.
+- Reproduction: NOT reproduced — after restart, i1 x3 (36 req incl. the
+  same request index), i1t (12), i2 (12) all clean; zero Out-of-vocab,
+  zero crash. Classified stochastic residual of the known drafter hole;
+  hammer 200/200 re-verified post-restart. Hardening (worker-side clamp)
+  stays on the 0012 backlog as 0020 candidate if it recurs.
