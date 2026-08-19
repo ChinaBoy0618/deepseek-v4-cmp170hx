@@ -18,14 +18,15 @@ Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 | 0016 | draft-window FSM overfeed | scheduler.py, backend_xgrammar.py | accept_tokens break on stop; draft filter -> validate_tokens_ex; 612 warnings 39->0 |
 | 0017 | soup signature extension + cap-hit clean boundary | scheduler.py | 9 new pseudo-tag signatures (issue-1/2 sessions); _dsv4_clean_cut backtracks cap-hit to unclosed-'<' |
 | 0018 | thinking-variant absorption | parser/deepseek_v4.py | <thinking>/</thinking> strip-only terminals (issue-1, 99x leak) |
-| 0019 | line-repetition tripwire | scheduler.py | short-line >=5x streak-6 -> FINISHED_STOPPED (issue-2 Lets reload.x60); DSV4_REPETITION_TRIPWIRE / DSV4_REP_STREAK knobs |
+| 0019 | line-repetition tripwire | scheduler.py | short-line >=5x streak-6 -> FINISHED_STOPPED (issue-2 Lets reload.x60); DSV4_REPETITION_TRIPWIRE / DSV4_REP_STREAK / DSV4_SOUP_TOTAL knobs |
+| 0017v2 | soup cumulative totals | scheduler.py | fire on streak>=12 OR total>=DSV4_SOUP_TOTAL(18); sparse pseudo-tag leakage (live-TDD finding) |
 
 Backups on this tree: *.bak-<patch#> beside each patched file
 (scheduler.py.bak-0019 / deepseek_v4.py.bak-0018 are the immediate rollback points;
 .bak-0016 for 0016; etc. Full rollback: DSV4_NO_MOUNT=1 launches the
 baked image instead of this mount).
 
-Env knobs: DSV4_SALVAGE_TOKEN_BUDGET / DSV4_SALVAGE_GUARD / DSV4_SOUP_TRIPWIRE / DSV4_SOUP_STREAK / DSV4_GRAMMAR_SALVAGE / DSV4_REPETITION_TRIPWIRE / DSV4_REP_STREAK
+Env knobs: DSV4_SALVAGE_TOKEN_BUDGET / DSV4_SALVAGE_GUARD / DSV4_SOUP_TRIPWIRE / DSV4_SOUP_STREAK / DSV4_GRAMMAR_SALVAGE / DSV4_REPETITION_TRIPWIRE / DSV4_REP_STREAK / DSV4_SOUP_TOTAL
 
 Log signatures (monitoring): "DSV4 0014 salvage-guard armed|salvage-cap hit|degenerate-signature", "DSV4 0015 soup-tripwire", "DSV4 0017 salvage-cap clean-cut", "DSV4 0019 rep-tripwire", "Grammar completed mid-block ... (TYPE-A)", "TYPE-B", grammar_matcher.cc:612 (should stay 0 post-0016).
 

@@ -1,0 +1,45 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -171,6 +171,9 @@
+             and bool(self._dsv4_sig_first_ids)
+         )
+         self._dsv4_soup_streak = int(os.environ.get("DSV4_SOUP_STREAK", "12"))
++        # DSV4 0017 v2: sparse pseudo-tag leakage cannot saturate the
++        # consecutive streak; fire on cumulative detection-blocks too.
++        self._dsv4_soup_total = int(os.environ.get("DSV4_SOUP_TOTAL", "18"))
+         # DSV4 0019: line-repetition tripwire knobs (issue-2 loops).
+         self._dsv4_rep_enabled = (
+             os.environ.get("DSV4_REPETITION_TRIPWIRE", "1") != "0"
+@@ -2564,9 +2567,17 @@
+                 if _s not in _tags:
+                     _streaks[_s] = 0
+             _fired = None
++            _totals = getattr(request, "_dsv4_sig_totals", None)
++            if _totals is None:
++                _totals = {}
++                request._dsv4_sig_totals = _totals
+             for _s in _tags:
+                 _streaks[_s] = _streaks.get(_s, 0) + 1
+-                if _streaks[_s] >= self._dsv4_soup_streak:
++                _totals[_s] = _totals.get(_s, 0) + 1
++                if (
++                    _streaks[_s] >= self._dsv4_soup_streak
++                    or _totals[_s] >= self._dsv4_soup_total
++                ):
+                     _fired = _s
+                     break
+             if _fired is not None:
+@@ -2581,11 +2592,12 @@
+                     del new_token_ids[max(0, _cut - _pre_len):]
+                 logger.warning(
+                     "DSV4 0015 soup-tripwire for request %s: signature "
+-                    "%r held the tail for %s iterations, trimmed %s "
++                    "%r streak %s total %s, trimmed %s "
+                     "tokens, finishing FINISHED_STOPPED.",
+                     request.request_id,
+                     _fired,
+                     _streaks[_fired],
++                    _totals.get(_fired, 0),
+                     _removed,
+                 )
+                 request.status = RequestStatus.FINISHED_STOPPED

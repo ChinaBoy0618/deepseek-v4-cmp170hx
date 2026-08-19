@@ -525,3 +525,21 @@ Changes (TDD: `tdd_0019.py` R00-R09):
 Residual (honest boundary): cross-message loops (752 announce-only messages
 across turns) remain client-domain — the server cannot see cross-request
 session state.
+
+### 0017v2 — soup tripwire cumulative totals (2026-08-19, live-TDD finding)
+
+The first live run of the extended table exposed a semantics gap: the issue-1
+replay emits pseudo-tags SPARSELY (~1 per 50 tokens), and the 0015
+consecutive-streak rule (same signature in the 22-token window 12 blocks in a
+row) can never saturate — window residency per occurrence is only ~3 blocks.
+Table hits with zero fires.
+
+- `scheduler.py`: per-request `_dsv4_sig_totals` cumulative detection-block
+  counters; fire when `streak >= 12 OR total >= DSV4_SOUP_TOTAL (18)`
+  (~6-8 sparse occurrences; legit discussion docs with <=4 mentions stay
+  far below). Log line now reports `streak N total M`.
+- TDD: `tdd_0017.py` U15 (12 sparse occurrences fire) / U16 (4 legit
+  mentions never fire) / U17 (one-shot never fires).
+- Apply order note: 0017 -> 0018 -> 0019 -> 0017v2 (v2 was written after
+  0019 on the live tree; patch boundaries follow the backup chain
+  `.bak-0019`/`.bak-0017v2`).
