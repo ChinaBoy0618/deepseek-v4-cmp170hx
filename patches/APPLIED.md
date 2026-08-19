@@ -32,3 +32,5 @@ Env knobs: DSV4_SALVAGE_TOKEN_BUDGET / DSV4_SALVAGE_GUARD / DSV4_SOUP_TRIPWIRE /
 Log signatures (monitoring): "DSV4 0014 salvage-guard armed|salvage-cap hit|degenerate-signature", "DSV4 0015 soup-tripwire", "DSV4 0017 salvage-cap clean-cut", "DSV4 0019 rep-tripwire", "Grammar completed mid-block ... (TYPE-A)", "TYPE-B", grammar_matcher.cc:612 (should stay 0 post-0016).
 
 Validation state (2026-08-19 three-round battery): ctx 4.7K-498K 64/64 arms-pass, 24-turn agentic loop to 162K clean, 20-tool schemas clean, hammer 200/200, soak 1399/1400 (1 client-side transient, server zero non-200), 612=0, TYPE-B=0, salvage=0, crashes=0.
+
+Issue-replay state (2026-08-19 late, 0019v2 stack): verbatim issue-1/2 poison replay (i1 x4/i1t/i2, temp 1.0) zero errors, think_leak=0, soup cumulative fired correctly, rep-tripwire 9/20 induction + 0 false kills on 3/3 probes, hammer 200/200. One stochastic crash 11:42 (0010 OOV sentinel first-fire -> PP3 device assert): not reproduced in 60 poisoned requests, see README incident notes.
