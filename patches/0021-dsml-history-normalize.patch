@@ -1,0 +1,87 @@
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -368,6 +368,72 @@
+ # Preprocessing
+ # ============================================================
+ 
++# ============================================================
++# DSV4 0021: raw-DSML history normalization
++# ============================================================
++import re as _re_0021
++
++_DSML_0021_BLOCK_RE = _re_0021.compile(
++    r"<(?:tool_calls>|｜DSML｜_?tool_calls>)\s*(.*?)</(?:tool_calls>|｜DSML｜_?tool_calls>)",
++    _re_0021.S)
++_DSML_0021_INVOKE_RE = _re_0021.compile(
++    r'<｜DSML｜invoke name="([^"]+)">\s*(.*?)</｜DSML｜invoke>', _re_0021.S)
++_DSML_0021_PARAM_RE = _re_0021.compile(
++    r'<｜DSML｜parameter name="([^"]+)"(?: string="(true|false)")?>(.*?)</｜DSML｜parameter>',
++    _re_0021.S)
++
++
++def extract_dsml_tool_calls(content):
++    """(leftover_text, tool_calls) when `content` carries a COMPLETE
++    raw DSML tool-call block; None when it does not (or the block is
++    unbalanced prose that merely mentions the tags)."""
++    if not isinstance(content, str) or "<｜DSML｜invoke" not in content:
++        return None
++    calls = []
++    for m in _DSML_0021_BLOCK_RE.finditer(content):
++        block = m.group(1)
++        invokes = _DSML_0021_INVOKE_RE.findall(block)
++        if not invokes or len(invokes) != block.count("<｜DSML｜invoke"):
++            return None
++        for name, argblob in invokes:
++            params = _DSML_0021_PARAM_RE.findall(argblob)
++            if len(params) != argblob.count("<｜DSML｜parameter"):
++                return None
++            args = {}
++            for key, is_str, val in params:
++                try:
++                    args[key] = val if is_str != "false" else json.loads(val)
++                except Exception:
++                    return None
++            calls.append({
++                "id": f"dsv4-dsml-{len(calls)}",
++                "type": "function",
++                "function": {"name": name,
++                             "arguments": json.dumps(args, ensure_ascii=False)},
++            })
++    if not calls:
++        return None
++    leftover = _DSML_0021_BLOCK_RE.sub("", content).strip()
++    return leftover, calls
++
++
++def _normalize_dsml_history_messages(messages):
++    """Assistant messages with a raw DSML block in content and no
++    structured tool_calls get the block lifted into tool_calls so the
++    canonical template renders it (0021)."""
++    out = []
++    for msg in messages:
++        if msg.get("role") == "assistant" and not msg.get("tool_calls"):
++            ext = extract_dsml_tool_calls(msg.get("content"))
++            if ext is not None:
++                leftover, calls = ext
++                msg = dict(msg)
++                msg["content"] = leftover
++                msg["tool_calls"] = calls
++        out.append(msg)
++    return out
++
++
+ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     """
+     Merge tool messages into the preceding user message using content_blocks format.
+@@ -506,9 +572,11 @@
+ 
+     # Preprocess: merge tool messages and sort tool results
+     messages = merge_tool_messages(messages)
++    messages = _normalize_dsml_history_messages(messages)
+     messages = sort_tool_results_by_call_order(context + messages)[len(context):]
+     if context:
+         context = merge_tool_messages(context)
++        context = _normalize_dsml_history_messages(context)
+         context = sort_tool_results_by_call_order(context)
+ 
+     full_messages = context + messages
