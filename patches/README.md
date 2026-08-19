@@ -11,7 +11,7 @@ have seen claimed for this range does not survive a paired A/B.
 On `c3046d1`:
 
 - **Drop `0001`** — its `has_device_capability(90)` gate is now upstream.
-- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009` apply unchanged, zero rejects**, in glob order.
+- **`0002 0003 0004 0005 0005a 0006 0007 0008 0009 0010 0011 0012 0013` apply unchanged, zero rejects**, in glob order. (0012 needs the 0007-0011 series present; its scheduler hunks context-match the patched tree. 0013 needs 0012 present — it rewrites 0012's grammar block.)
   (`0005a` must still precede `0006`; the glob order does that.)
 - ⚠️ **The range touches `csrc/`** (`libtorch_stable/topk.cu` FilteredTopK decode routing —
   one of the real wins — plus `marlin.cu`, `custom_all_reduce.cuh`), so
@@ -115,6 +115,34 @@ in **ascending position order**, whereas `torch.topk` returns *score* order.
 naive mask-then-`torch.topk` reimplementation compiles and runs but feeds wrongly ordered
 indices downstream.
 
+## DSpark OOV sentinel guard (0010) — engine-death belt at the grammar boundary
+
+DSpark can surface its draft-buffer sentinel (id == vocab_size) as a sampled
+token when a degraded draft stream meets an empty grammar row. Committing it
+feeds the sentinel id back into the next forward embedding lookup and kills
+the worker with a device-side assert (2x on 2026-08-18, /v1/messages with
+forced tools). 0010 truncates the block at the first out-of-vocab id, rolls
+the suffix back, and abandons structured enforcement for the request — the
+same salvage policy as 0008, one layer down.
+
+The guard itself first shipped with a latent crash: it read
+model_config.vocab_size, which c3046d1 removed in favor of get_vocab_size();
+the first live trigger AttributeErrored EngineCore dead (2026-08-18 10:52,
+all of /v1/messages went 500 until restart). The patch here carries the
+fixed call — take it, not the pre-fix 760 checkout copy.
+
+## Structural-tag reasoning port (0011) — port of upstream vllm#46149 (closed unmerged)
+
+Upstream _apply_structural_tag hardcodes reasoning=False, so a thinking
+request with a constrained tool_choice gets a grammar that models only the
+tool-call suffix; the FSM then rejects tokens at the reasoning->tool_call
+boundary. Ports all three commits of the PR: _reasoning_enabled() reads the
+per-request reasoner (abstract_parser.py), thinking_enabled is exposed on
+the engine adapter (adapters.py), and _grammar_from_tool_parser=True makes
+enforcement start at token 0 once the tag includes reasoning. Validated
+live 2026-08-18 on dsv4s: 10-arm matrix (OpenAI + Anthropic endpoints x
+forced/required/auto x thinking x stream) plus 35-request unique-prompt
+stress — zero FSM rejections, zero engine deaths.
 ## Spec-decode grammar commit invariant (0009) — port of upstream #52452 + #51870
 
 The principled fix for the class 0008 mitigates: instead of abandoning (or
@@ -228,3 +256,204 @@ one that costs an afternoon because its message blames the wrong model:
 1. `v1/worker/gpu/spec_decode/dspark/utils.py` — `NotImplementedError: DSpark does not support pipeline parallelism.`
 2. `v1/worker/gpu/model_runner.py` — `ValueError: {method} with pipeline parallel is not supported.`
 3. `config/model.py` — `NotImplementedError: Pipeline parallelism is not supported for this model. Supported models implement the SupportsPP interface.` This fires at **config** time, on the **draft** architecture, and reads like a problem with the target model.
+
+## Scheduler/worker history desync fix (0012) — root cause of the 2026-08-18 rank-3 deaths
+
+0009/0010 truncated the accepted speculative block on the SCHEDULER side
+only. The worker's input_batch had already committed the full block, so
+every truncation left the two token histories permanently out of sync:
+each later engine step re-sent the suffix, the spec window misaligned, and
+the DSpark drafter eventually read its anchor from a stale slot of the
+preallocated input buffer -- an id >= vocab_size, a device-side assert in
+markov_w1/draft embedding on the drafter PP rank, and EngineDead (2x on
+2026-08-18; /tmp/dsv4-crash-0818-1213.log lines 947-2330). Both upstream
+PRs 0009 ported (#51870, #52452) are still UNMERGED drafts -- no upstream
+fix to inherit; this is ours.
+
+0012 removes every scheduler-side truncation/rollback path instead of
+fixing the arithmetic:
+
+- grammar block: validate-only via filter_speculative_grammar_tokens,
+  then abandon enforcement (0008 salvage semantics) and commit the block
+  unchanged. _kept is deliberately unused -- committing it would recreate
+  the desync.
+- OOV block (0010): keep detection as a tripwire, but finish the request
+  with FINISHED_ERROR and commit nothing. Dropping the block is only safe
+  because the request ends here.
+- speculator.py (new mount): clamp the drafter anchor to
+  [0, get_vocab_size()-1] right after the buffer read, the same hardening
+  the fused Markov kernel already applies to its outputs. A desynced
+  anchor now costs one rejected draft chain, not the worker.
+
+Also worth knowing: the 12:10:46 xgrammar grammar_matcher.cc:612 warnings
+and the acceptance-rate collapse (72% -> 32%) right before the crash were
+the desync already in progress, not a separate grammar bug.
+
+## Grammar-rejection bifurcation (0013) — closing the unconstrained-tail leak
+
+0012 made grammar rejections survivable by committing the block unchanged and
+abandoning enforcement. The canary proved the engine survives — but the cost
+surfaced the same night: a Claude Code session (127k input tokens) died when
+the model's output degraded into tag soup; 0012's "abandon enforcement" let
+the garbage tail stream unconstrained and the client's tool-call parse
+failed. Forensics + upstream triage (#43338 reports the same bleed class)
+split grammar rejections into two kinds with different correct handling:
+
+- **TYPE-A — FSM terminated inside the block.** The rejected suffix is
+  post-completion garbage (the grammar already emitted its full valid
+  output). 0013 keeps the valid prefix, commits it, and finishes the request
+  (FINISHED_STOPPED). The request leaves the running set in the same
+  iteration, so no future spec window can consume the scheduler/worker
+  divergence — the same invariant that makes the stock stop-truncation
+  (`del new_token_ids[num_new:]`) safe. This is a repair, not just a
+  mitigation: the client receives complete schema-valid output.
+
+- **TYPE-B — FSM still live.** Mid-stream violation, exactly what 0008's
+  salvage was built for (long-context DSML degradation). Behavior unchanged
+  from 0012; the only addition is a distinct "TYPE-B" log line so the real
+  prevalence becomes measurable before any further tightening.
+
+Mechanics:
+
+- `backend_xgrammar.py`: new `validate_tokens_ex(tokens) -> (prefix,
+  terminated)` — like `validate_tokens`, but breaks at FSM termination and
+  reports it. The entry `_is_terminated` guard plus breaking *before*
+  offering the next token also removes this path's grammar_matcher.cc:612
+  warnings. (The #37506-style `_is_terminated` sync in `accept_tokens`'
+  failure path was already present in this tree.)
+- `__init__.py`: `filter_speculative_grammar_tokens` now returns a 3-tuple
+  `(kept, rejected, terminated)`; backends without `validate_tokens_ex`
+  report `terminated=False` and keep 0012 semantics.
+- `scheduler.py`: the TYPE-A truncation happens before the commit, but the
+  explicit FINISHED_STOPPED is applied *after* `_update_request_with_output`
+  returns (stock `check_stop` owns `stopped`/truncation inside that call).
+  An empty valid prefix finishes immediately, mirroring the 0012 OOV block.
+
+Note for porters: this fork has **no** stock `is_terminated` → finish hook —
+`__init__.py` only stops masking/advancing after termination, so requests
+decode unconstrained to EOS/max_tokens. That is why 0013 must finish
+explicitly. Upstream faces the same trade (current main kills such requests
+via the accept-failure path instead of bleeding prefixes, per #43338); a
+clean truncate-and-finish does not exist upstream as of 2026-08-18
+(#52452/#51870/#37506 all open, zero merges in this family).
+
+## Post-salvage damage guard (0014) — bounding the TYPE-B unconstrained tail
+
+0013 closed the TYPE-A leak; TYPE-B keeps 0012 salvage semantics (commit
+unchanged, abandon enforcement). The remaining cost of that safety choice is
+the **unconstrained tail**: after salvage fires, the request generates
+grammar-free until EOS/stop/max_tokens. The 2026-08-18 dead-session
+post-mortem (14:50-15:05Z window in `dsv4-run-0012canary-final.log`: 16
+salvage fires, all TYPE-B "1-2 of 3-6 tokens rejected", 75 salvage / 0
+crashes over the full run) showed what that tail looks like under long
+context: the model emits hallucinated control-tag soup (`<reference>`,
+`<tool_calls>`, `<｜DSML｜invoke … string="false">`, `<text_placeholder>`,
+`<dies_cmd_wrapper>` …) and the client-side tool-call parse dies.
+
+0014 bounds exactly that tail, nothing else. Two mechanisms, armed together
+at the (single, per-request) salvage point:
+
+- **A — token budget.** `DSV4_SALVAGE_TOKEN_BUDGET` (default 64; negative
+  disables). Post-salvage tokens decrement the budget; exhaustion finishes
+  the request FINISHED_STOPPED with stock-stop semantics (committed tokens
+  stay). Caps the damage window regardless of what the model does.
+- **C' — degenerate-signature watch.** After each post-salvage token, the
+  last 24 output tokens are decoded and matched against
+  `_DSV4_SIG_STRINGS` — only markers that cannot occur in legitimate
+  structured output (the DSML invoke special token itself is deliberately
+  excluded). On hit, the in-flight signature tokens are trimmed (both
+  `_output_token_ids` and `_all_token_ids`, prompt-offset aware) and the
+  request finishes. Decode-based matching, not id-sequence matching, so
+  context-dependent tokenization cannot evade it. `DSV4_SALVAGE_GUARD=0`
+  disables.
+
+Safety argument for the C' trim: the request finishes in the same iteration
+(status set inside `_update_request_with_output`, mirroring `check_stop`),
+so no later spec window ever observes the cut — the same invariant as the
+stock stop truncation and 0013 TYPE-A. `Request` has no `__slots__`, so the
+guard state attaches as dynamic attributes; no `request.py` change, no new
+mounted file.
+
+New log lines (distinct for measurement): `DSV4 0014 salvage-guard armed`,
+`DSV4 0014 salvage-cap hit`, `DSV4 0014 degenerate-signature`.
+
+Honest scope note: this is damage *bounding*, not a repair. Of 75 observed
+salvage fires only ~1 produced client-visible failure — most tails
+self-recover into valid output. A cuts the garbage volume; C' catches the
+degenerate case early. Client-side parse resilience is still the other half
+of the dead-session failure mode.
+
+### 0015 — always-on degenerate tag-soup tripwire (2026-08-19, v3)
+
+Trigger: replaying the dead-session context against the 0014 canary
+(30 reqs, 80K prompt, real Bash tool, temp 0.6) reproduced the degeneration
+NATURALLY — 11 tag-soup leaks and one fatal `finish=length`-no-tool-call —
+with **zero** TYPE-B salvage fires and zero guard activations. The dominant
+residual failure is in-context soup imitation, not the salvage path, so the
+0014 post-salvage watch structurally cannot bound it. The replay also showed
+the model emits `<original_output>` (not in the 0014 table).
+
+Changes (scheduler.py only, same dynamic-attribute approach):
+- Signature table += `<original_output`. All table entries are tags that
+  CANNOT occur in legitimate output: the DSML tool-call wrapper
+  (`｜DSML｜tool_calls` open/close) is deliberately NOT a signature —
+  v2 of this patch tried a fullwidth `｜tool_calls>` entry and it
+  matched every legitimate tool call, firing 40x in soak (each firing
+  trimmed 1-2 legit wrapper-close tokens). Removed in v3.
+- `_dsv4_sig_first_ids`: first-token id per signature for a cheap
+  prefilter (id scan, no tokenizer call in the common case).
+- Always-on tripwire after the append loop of
+  `_update_request_with_output`, **new-token streak semantics** (v3):
+  the checked window is the tokens appended THIS block plus a 16-token
+  overlap; per-request per-signature counters track CONSECUTIVE blocks
+  whose window contains the signature. Fire when a signature streaks
+  across `DSV4_SOUP_STREAK` iterations (default 12) -> trim this
+  iteration's tokens (cut floored at `_pre_len`) + FINISHED_STOPPED +
+  resumable=False. Same finish-this-iteration truncation invariant as
+  0013 TYPE-A / 0014 C'.
+- Why v3 semantics: (a) per-window density (v1) false-positives on
+  legitimately writing the signature table into patches; (b) a fixed
+  tail window (v2) lets a single legit tag parked at the END of the
+  output hold the window until the streak fires — the new-token window
+  freezes a legit end tag at <=4 while soup (tags in every block for
+  hundreds of tokens) reaches 12. `DSV4_SOUP_TRIPWIRE=0` disables.
+
+Validation: sustained-soup induction fires at exactly streak 12 (trimmed
+6 tokens, FINISHED_STOPPED, clean prefix delivered); tuple-echo of the
+signature table does NOT fire (natural stop, content intact); dead-session
+replay post-0015: 0 fatal / 30, tool calls 30/30, residual 2 short
+self-recovering bursts correctly left untouched.
+
+New log line: `DSV4 0015 soup-tripwire`.
+
+Scope honesty: converts the fatal burn-the-whole-budget soup case into a
+clean early stop and bounds soup leakage to the streak window (~30-60
+tokens). It does not stop the model from *starting* to imitate soup in a
+poisoned context; that is a context-hygiene problem, not a server bug.
+
+### 0016 — draft-window FSM overfeed elimination (2026-08-19, round-1 fix)
+
+Trigger: the R1 context-size matrix (4.7K -> 285K prompt tokens, 4 arms,
+60/60 client-pass) still logged `grammar_matcher.cc:612` ("matcher has
+terminated ... trying to accept new token id 1") before nearly every
+0013 TYPE-A line. Root cause: the stock draft-filter sites
+(`scheduler.py update_draft_token_ids` / `update_draft_token_ids_in_output`)
+validate the WHOLE draft block with the old `validate_tokens`, which keeps
+offering tokens after the FSM accepted its stop token mid-block; the
+backend `accept_tokens` inner loop had the same hole. Harmless to output
+(0013 truncates at commit) but one C++ warning + wasted matcher work per
+tool-call request.
+
+Changes:
+- `backend_xgrammar.py accept_tokens`: break the loop as soon as the FSM
+  accepts its stop token — post-stop tokens are definitionally garbage.
+- `scheduler.py` both draft-filter sites: probe with `validate_tokens_ex`
+  (termination-aware, same accept+rollback semantics) when available,
+  falling back to stock `validate_tokens` on other backends.
+
+Expected effect: 612 warnings ~0 on normal tool-call traffic; TYPE-A
+truncations unchanged (that is the correct commit-time mechanism).
+
+Validation (0016 canary): ctx matrix 60/60, hammer 200/200, 612 count 0,
+TYPE-A still present and correct, induced-soup tripwire still fires,
+tuple-echo still passes.

@@ -1,0 +1,156 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1799,9 +1799,8 @@
+             # (id == vocab_size) as a sampled token when a degraded draft
+             # stream meets an empty grammar row. Committing it feeds the id
+             # back into the next forward's embedding lookup -> CUDA
+-            # device-side assert -> engine death (2x 2026-08-18). Truncate
+-            # at the first out-of-vocab id, roll back the suffix, and drop
+-            # structured enforcement for this request.
++            # device-side assert -> engine death (2x 2026-08-18). Finish
++            # the request with error and commit nothing (0012 semantics).
+             vocab_size = self.vllm_config.model_config.get_vocab_size()
+             oov_idx = next(
+                 (i for i, t in enumerate(new_token_ids) if t >= vocab_size),
+@@ -1810,25 +1809,27 @@
+             if oov_idx is not None:
+                 logger.warning(
+                     "Out-of-vocab token %s (vocab_size=%s) in output of "
+-                    "request %s; truncating %s-token block at position %s"
+-                    " and abandoning structured-output enforcement.",
++                    "request %s at position %s of %s; finishing the request "
++                    "with error and committing nothing.",
+                     new_token_ids[oov_idx],
+                     vocab_size,
+                     req_id,
+-                    len(new_token_ids),
+                     oov_idx,
++                    len(new_token_ids),
+                 )
++                # DSV4 0012: do NOT truncate-and-continue. The worker
++                # already committed the full block to input_batch, so a
++                # scheduler-side truncation desyncs the two token histories
++                # and misaligns every later spec window (the drafter anchor
++                # then reads stale buffer slots -> out-of-vocab embedding
++                # assert, 2x 2026-08-18). Dropping the block is only safe
++                # because the request ends here; mirror the stock
++                # grammar-terminate path instead.
+                 request.structured_output_request = None
+-                oov_rejected = len(new_token_ids) - oov_idx
+-                new_token_ids = new_token_ids[:oov_idx]
+-                if request.num_computed_tokens > 0:
+-                    request.num_computed_tokens -= oov_rejected
+-                if request.num_output_placeholders > 0:
+-                    request.num_output_placeholders -= oov_rejected
+-                num_accepted -= max(
+-                    oov_rejected - self.num_sampled_tokens_per_step, 0
+-                )
+-                assert num_accepted >= 0
++                new_token_ids = []
++                request.status = RequestStatus.FINISHED_ERROR
++                request.resumable = False
++                stopped = True
+             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+             kv_transfer_params = None
+             ec_transfer_params = None
+@@ -1841,39 +1843,31 @@
+                 and request.use_structured_output
+                 and not output_is_stale
+             ):
+-                new_token_ids, num_grammar_rejected = (
++                # DSV4 0012: validate only -- never truncate. The worker
++                # already committed the full block in
++                # _update_states_after_model_execute; a scheduler-side
++                # truncation desyncs the two token histories, misaligns
++                # every later spec window, and the drafter eventually
++                # reads a stale anchor slot: id >= vocab_size -> CUDA
++                # device-side assert on the drafter PP rank (2x 2026-08-18).
++                # Abandon enforcement (0008 salvage semantics) and commit
++                # the block unchanged.
++                _kept, num_grammar_rejected = (
+                     self.structured_output_manager.filter_speculative_grammar_tokens(
+                         request, new_token_ids
+                     )
+                 )
+                 if num_grammar_rejected > 0:
+-                    if request.num_computed_tokens > 0:
+-                        request.num_computed_tokens -= num_grammar_rejected
+-                    if request.num_output_placeholders > 0:
+-                        request.num_output_placeholders -= num_grammar_rejected
+-                    # Target-sampled tokens occupy the end of the output block.
+-                    # Removing that tail changes the accepted-draft count only
+-                    # when the rejected suffix extends into draft positions.
+-                    num_accepted -= max(
+-                        num_grammar_rejected - self.num_sampled_tokens_per_step,
+-                        0,
++                    logger.warning(
++                        "Grammar rejected %s of %s speculative tokens for "
++                        "request %s; abandoning structured-output "
++                        "enforcement and committing the block unchanged.",
++                        num_grammar_rejected,
++                        len(new_token_ids),
++                        req_id,
+                     )
+-                    assert num_accepted >= 0
+-                    if not new_token_ids:
+-                        # Entire block violates the grammar (e.g. the FSM
+-                        # terminated and the sampler produced no valid
+-                        # continuation). Committing nothing and resampling
+-                        # every step would spin until max_tokens; drop
+-                        # enforcement and let the request finish
+-                        # unconstrained (0008 salvage semantics).
+-                        logger.warning(
+-                            "All %s speculative tokens rejected by grammar "
+-                            "for request %s; abandoning structured-output "
+-                            "enforcement.",
+-                            num_grammar_rejected,
+-                            req_id,
+-                        )
+-                        request.structured_output_request = None
++                    # read-only property: the next line flips use_structured_output
++                    request.structured_output_request = None
+
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+                     spec_decoding_stats,
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -49,6 +49,13 @@
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+
++        # DSV4 0012: clamp bound for drafter anchor ids read from the
++        # persistent input buffer (markov_w1 and the draft embedding have
++        # exactly get_vocab_size() rows).
++        self._anchor_vocab_limit = (
++            vllm_config.model_config.get_vocab_size() - 1
++        )
++
+         # Whether to sample from the anchor position. When True, uses anchor-as-first
+         # (N slots, each position predicts the next token). When False, uses 1+N
+         # fill-in block (anchor is a bonus token).
+@@ -176,6 +183,12 @@
+         # Anchor (bonus) token per request = the input id at query offset 0,
+         # read via the precomputed persistent index (fixed buffer for capture).
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        # DSV4 0012: a scheduler/worker history desync can leave an anchor
++        # slot holding stale buffer memory; an id past the vocab is a
++        # device-side assert in markov_w1/draft embedding (eager) or an
++        # unchecked OOB read (fused kernel). Clamp like the fused kernel
++        # bounds its outputs; verification discards the corrupted draft.
++        prev = prev.clamp_(0, self._anchor_vocab_limit)
+
+         if self._fused_markov is not None:
+             # Same chain as the loop below, with each step's seven kernels and
+             # three [num_reqs, shard_width] round trips collapsed into one
+             # pass over markov_w2. Writes draft_tokens directly.
+--- a/launch/run-pp-dspark.sh
++++ b/launch/run-pp-dspark.sh
+@@ -87,6 +87,7 @@
+            v1/worker/gpu/pp_utils.py \
+            v1/worker/gpu/model_runner.py \
+            v1/worker/gpu/spec_decode/dspark/utils.py \
++           v1/worker/gpu/spec_decode/dspark/speculator.py \
+            model_executor/layers/sparse_attn_indexer.py \
+            parser/deepseek_v4.py \
+            v1/structured_output/backend_xgrammar.py \

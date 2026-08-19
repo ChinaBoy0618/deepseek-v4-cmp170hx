@@ -1,0 +1,220 @@
+--- a/vllm/v1/structured_output/backend_xgrammar.py	2026-08-18 23:43:57.921564480 +0800
++++ b/vllm/v1/structured_output/backend_xgrammar.py	2026-08-18 23:44:30.205778164 +0800
+@@ -193,6 +193,34 @@
+             self.matcher.rollback(len(accepted_tokens))
+         return accepted_tokens
+ 
++    def validate_tokens_ex(self, tokens: list[int]) -> tuple[list[int], bool]:
++        """Non-advancing probe that also reports FSM termination.
++
++        Like validate_tokens, but stops as soon as the FSM reaches its
++        terminal state and reports whether it did. Tokens past the
++        terminal state are definitionally unconstrained garbage, so the
++        caller can distinguish "grammar completed + trailing garbage"
++        (truncate-and-finish is safe) from a mid-stream violation (FSM
++        still live). Breaking before offering the next token to an
++        already-terminated matcher also avoids the xgrammar C++ warning
++        (grammar_matcher.cc:612).
++        """
++        if self._is_terminated:
++            return [], True
++        accepted_tokens = []
++        terminated = False
++        for token in tokens:
++            if not self.matcher.accept_token(token):
++                break
++            accepted_tokens.append(token)
++            if self.matcher.is_terminated():
++                terminated = True
++                break
++        if len(accepted_tokens) > 0:
++            # Rollback the FSM to the initial state
++            self.matcher.rollback(len(accepted_tokens))
++        return accepted_tokens, terminated
++
+     def rollback(self, num_tokens: int) -> None:
+         self.matcher.rollback(num_tokens)
+         self.num_processed_tokens -= num_tokens
+--- a/vllm/v1/structured_output/__init__.py	2026-08-18 23:43:57.925798351 +0800
++++ b/vllm/v1/structured_output/__init__.py	2026-08-18 23:44:30.206170883 +0800
+@@ -580,7 +580,7 @@
+         self,
+         request: "Request",
+         new_token_ids: list[int],
+-    ) -> tuple[list[int], int]:
++    ) -> tuple[list[int], int, bool]:
+         """Validate an accepted speculative block before it is committed.
+ 
+         Grammar masks cover scheduled draft positions, but an accepted block
+@@ -596,19 +596,22 @@
+             new_token_ids: Accepted tokens awaiting scheduler commit.
+ 
+         Returns:
+-            The tokens that are safe to commit and the rejected suffix length.
++            The tokens that are safe to commit, the rejected suffix length,
++            and whether the grammar reached its terminal state inside the
++            block (0013: distinguishes post-completion garbage tails from
++            mid-stream violations).
+         """
+         if self.vllm_config.speculative_config is None:
+-            return new_token_ids, 0
++            return new_token_ids, 0, False
+         if not new_token_ids or not request.use_structured_output:
+-            return new_token_ids, 0
++            return new_token_ids, 0, False
+ 
+         structured_request = request.structured_output_request
+         if structured_request is None:
+-            return new_token_ids, 0
++            return new_token_ids, 0, False
+         grammar = structured_request.grammar
+         if not isinstance(grammar, StructuredOutputGrammar):
+-            return new_token_ids, 0
++            return new_token_ids, 0, False
+ 
+         reasoner = self._get_reasoner(request)
+         grammar_start = 0
+@@ -623,17 +626,30 @@
+                 new_token_ids,
+             )
+             if boundary is None:
+-                return new_token_ids, 0
++                return new_token_ids, 0, False
+             grammar_start = boundary + 1
+ 
+         grammar_tokens = new_token_ids[grammar_start:]
+         if not grammar_tokens:
+-            return new_token_ids, 0
+-        valid_grammar_tokens = grammar.validate_tokens(grammar_tokens)
++            return new_token_ids, 0, False
++        # DSV4 0013: prefer the extended probe that also reports FSM
++        # termination; backends without it cannot distinguish termination
++        # from live violations, so they report not-terminated and the
++        # scheduler keeps the 0012 salvage semantics.
++        probe = getattr(grammar, "validate_tokens_ex", None)
++        if probe is not None:
++            valid_grammar_tokens, grammar_terminated = probe(grammar_tokens)
++        else:
++            valid_grammar_tokens = grammar.validate_tokens(grammar_tokens)
++            grammar_terminated = False
+         rejected = len(grammar_tokens) - len(valid_grammar_tokens)
+         if rejected == 0:
+-            return new_token_ids, 0
+-        return new_token_ids[:grammar_start] + valid_grammar_tokens, rejected
++            return new_token_ids, 0, grammar_terminated
++        return (
++            new_token_ids[:grammar_start] + valid_grammar_tokens,
++            rejected,
++            grammar_terminated,
++        )
+ 
+     def clear_backend(self) -> None:
+         if self.backend is not None:
+--- a/vllm/v1/core/sched/scheduler.py	2026-08-18 23:43:57.930232148 +0800
++++ b/vllm/v1/core/sched/scheduler.py	2026-08-18 23:44:30.206829702 +0800
+@@ -1836,6 +1836,9 @@
+             prefill_stats = None
+             status_before_stop = request.status
+             num_output_tokens_before = len(request._output_token_ids)
++            # DSV4 0013: set when the grammar completes inside this block
++            # (TYPE-A); drives the explicit finish after the commit below.
++            grammar_completed = False
+ 
+             if (
+                 new_token_ids
+@@ -1843,31 +1846,61 @@
+                 and request.use_structured_output
+                 and not output_is_stale
+             ):
+-                # DSV4 0012: validate only -- never truncate. The worker
+-                # already committed the full block in
++                # DSV4 0013: validate only -- never truncate a live FSM.
++                # The worker already committed the full block in
+                 # _update_states_after_model_execute; a scheduler-side
+                 # truncation desyncs the two token histories, misaligns
+                 # every later spec window, and the drafter eventually
+                 # reads a stale anchor slot: id >= vocab_size -> CUDA
+                 # device-side assert on the drafter PP rank (2x 2026-08-18).
+-                # Abandon enforcement (0008 salvage semantics) and commit
+-                # the block unchanged.
+-                _kept, num_grammar_rejected = (
++                # Bifurcate by FSM state:
++                #   TYPE-A (FSM terminated in-block): the rejected suffix is
++                #     post-completion garbage. Keep the valid prefix, commit
++                #     it, and finish the request this iteration -- no future
++                #     spec window exists, so the truncation is desync-safe
++                #     (same invariant as the stock stop-truncation). Without
++                #     this, the unconstrained tail corrupted client
++                #     tool-call parsing (dead session 2026-08-18 22:59).
++                #   TYPE-B (FSM still live): keep 0012 salvage -- commit the
++                #     block unchanged and abandon enforcement; counted via
++                #     its distinct log line before any further tightening.
++                _kept, num_grammar_rejected, grammar_terminated = (
+                     self.structured_output_manager.filter_speculative_grammar_tokens(
+                         request, new_token_ids
+                     )
+                 )
+                 if num_grammar_rejected > 0:
+-                    logger.warning(
+-                        "Grammar rejected %s of %s speculative tokens for "
+-                        "request %s; abandoning structured-output "
+-                        "enforcement and committing the block unchanged.",
+-                        num_grammar_rejected,
+-                        len(new_token_ids),
+-                        req_id,
+-                    )
+-                    # read-only property: the next line flips use_structured_output
+-                    request.structured_output_request = None
++                    if grammar_terminated:
++                        logger.warning(
++                            "Grammar completed mid-block for request %s "
++                            "(TYPE-A); keeping %s valid tokens, truncating "
++                            "%s post-termination tokens and finishing the "
++                            "request.",
++                            req_id,
++                            len(_kept),
++                            num_grammar_rejected,
++                        )
++                        new_token_ids = _kept
++                        grammar_completed = True
++                        if not new_token_ids:
++                            # Nothing valid to commit (the grammar was
++                            # already complete before this block); finish
++                            # here directly.
++                            request.status = RequestStatus.FINISHED_STOPPED
++                            request.resumable = False
++                            stopped = True
++                    else:
++                        logger.warning(
++                            "Grammar rejected %s of %s speculative tokens "
++                            "for request %s (TYPE-B: FSM still live); "
++                            "abandoning structured-output enforcement and "
++                            "committing the block unchanged.",
++                            num_grammar_rejected,
++                            len(new_token_ids),
++                            req_id,
++                        )
++                        # read-only property: the next line flips use_structured_output
++                        request.structured_output_request = None
+ 
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -1883,6 +1916,18 @@
+                 new_token_ids, stopped = self._update_request_with_output(
+                     request, new_token_ids, is_stale=output_is_stale
+                 )
++                if grammar_completed and not stopped:
++                    # DSV4 0013 TYPE-A finish: the grammar completed at the
++                    # end of the committed prefix. Stock v1 only stops
++                    # masking after termination and decodes unconstrained
++                    # to EOS/max_tokens -- that leak is what 0013 closes.
++                    # Finishing here keeps the emitted output
++                    # schema-valid; the request leaves the running set in
++                    # this iteration, so the truncated worker-side tail is
++                    # never consumed by a later spec window.
++                    request.status = RequestStatus.FINISHED_STOPPED
++                    request.resumable = False
++                    stopped = True
+             elif request.pooling_params and pooler_output is not None:
+                 # Pooling stops as soon as there is output.
+                 request.status = RequestStatus.FINISHED_STOPPED

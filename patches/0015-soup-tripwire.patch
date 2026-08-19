@@ -1,0 +1,118 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -84,6 +84,7 @@
+         "text_placeholder",
+         "<edit-path",
+         "<source>placeholder",
++        "<original_output",
+     )
+ 
+     def __init__(
+@@ -130,6 +131,33 @@
+         else:
+             self._dsv4_sig_cutback = 0
+ 
++        # DSV4 0015: first-token ids of every signature, for the cheap
++        # tail prefilter (scan 24 ids against a set before decoding).
++        if _tok is not None:
++            self._dsv4_sig_first_ids = frozenset(
++                _ids[0]
++                for _ids in (
++                    _tok.encode(s, add_special_tokens=False)
++                    for s in self._DSV4_SIG_STRINGS
++                )
++                if _ids
++            )
++        else:
++            self._dsv4_sig_first_ids = frozenset()
++        # DSV4 0015: always-on degenerate tag-soup tripwire. The dead
++        # session AND the 2026-08-19 replay showed soup imitation with
++        # zero grammar-salvage involvement, so the 0014 post-salvage
++        # watch alone cannot bound it. Streak semantics: the SAME
++        # signature must persist in the 24-token tail for this many
++        # consecutive scheduler iterations before firing, so one-shot
++        # legitimate mentions (e.g. writing this very patch) never
++        # trigger. DSV4_SOUP_TRIPWIRE=0 disables.
++        self._dsv4_soup_enabled = (
++            os.environ.get("DSV4_SOUP_TRIPWIRE", "1") != "0"
++            and bool(self._dsv4_sig_first_ids)
++        )
++        self._dsv4_soup_streak = int(os.environ.get("DSV4_SOUP_STREAK", "12"))
++
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+         # by update_from_outputs(). This is currently used in the multi-engine
+@@ -2318,6 +2346,22 @@
+         _tail = _tok.decode(request._output_token_ids[-24:])
+         return any(_s in _tail for _s in self._DSV4_SIG_STRINGS)
+ 
++    def _dsv4_soup_tags(self, request: Request, new_token_ids) -> set:
++        """DSV4 0015 v3: which signatures appear in the tokens appended
++        THIS block plus a 16-token overlap. A tag only counts while new
++        tokens keep arriving around it -- a legit tag parked at the end
++        of the output stops counting immediately, while soup keeps
++        producing tags every block. First-token prefilter keeps the
++        common case at an id scan with no tokenizer call."""
++        _win = request._output_token_ids[-(len(new_token_ids) + 16):]
++        if not any(_t in self._dsv4_sig_first_ids for _t in _win):
++            return set()
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return set()
++        _txt = _tok.decode(_win)
++        return {_s for _s in self._DSV4_SIG_STRINGS if _s in _txt}
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2393,6 +2437,50 @@
+             if stopped:
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
++        # DSV4 0015: always-on degenerate tag-soup tripwire, streak
++        # semantics. Real soup keeps the same signature inside the
++        # 24-token tail for dozens of consecutive iterations; a
++        # legitimate one-shot listing keeps each tag alive only ~6-7
++        # windows (tag tokens + window), so streak 12 separates them.
++        # Uses the same finish-this-iteration truncation invariant as
++        # 0013 TYPE-A and 0014 C' (cut floored at _pre_len: never
++        # touches tokens committed by earlier iterations).
++        if not stopped and self._dsv4_soup_enabled:
++            _tags = self._dsv4_soup_tags(request, new_token_ids)
++            if getattr(request, "_dsv4_soup_streaks", None) is None:
++                request._dsv4_soup_streaks = {}
++            _streaks = request._dsv4_soup_streaks
++            for _s in _streaks:
++                if _s not in _tags:
++                    _streaks[_s] = 0
++            _fired = None
++            for _s in _tags:
++                _streaks[_s] = _streaks.get(_s, 0) + 1
++                if _streaks[_s] >= self._dsv4_soup_streak:
++                    _fired = _s
++                    break
++            if _fired is not None:
++                _out = request._output_token_ids
++                _cut = max(_pre_len, len(_out) - self._dsv4_sig_cutback)
++                _removed = len(_out) - _cut
++                if _removed > 0:
++                    del _out[_cut:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _cut:
++                    ]
++                    del new_token_ids[max(0, _cut - _pre_len):]
++                logger.warning(
++                    "DSV4 0015 soup-tripwire for request %s: signature "
++                    "%r held the tail for %s iterations, trimmed %s "
++                    "tokens, finishing FINISHED_STOPPED.",
++                    request.request_id,
++                    _fired,
++                    _streaks[_fired],
++                    _removed,
++                )
++                request.status = RequestStatus.FINISHED_STOPPED
++                request.resumable = False
++                return new_token_ids, True
+         return new_token_ids, stopped
+ 
+     def _free_encoder_inputs(self, request: Request) -> None:
