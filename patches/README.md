@@ -488,3 +488,40 @@ Validation: unit suite 19/19 in-container (real Scheduler + real tokenizer);
 live poisoned-replay pre-fix tripwire-delta 0 / 3-of-20 requests leaked 5+
 pseudo-tags uncut -> post-fix fires + tails cut; legit-literal probes
 no-false-kill; hammer regression 200/200.
+
+### 0018 — `<thinking>` hallucinated-variant absorption (2026-08-19, issue-fix P1-a)
+
+Trigger: issue-1 session 73db6fa4 showed `<thinking>`/`</thinking>` 99/96
+times in VISIBLE text — the deepseek_v4 reasoning parser only knows
+`<think>`/`</think>`, so the hallucinated variant flowed into content.
+
+Changes (TDD: `tdd_0018.py` V1-V4 RED -> GREEN, V5-V7 stay GREEN):
+- `vllm/parser/deepseek_v4.py`: new terminals `THINK_START_V`/`THINK_END_V`
+  (`<thinking>`/`</thinking>`, text + token-id) with pure-absorb transitions
+  in CONTENT and REASONING states (no events, no state change).
+- **Strip-only by design**: an unclosed variant inside a legit document
+  cannot route the rest of the output into reasoning_content (the trap that
+  routing-to-reasoning would create); inner text stays visible, tags vanish.
+  Cross-pairs (`<think>` ... `</thinking>`) are handled since both closes
+  are recognized.
+- The 0017 scheduler-side `<thinking>` signature stays as the soup backstop
+  (parser strips in normal traffic; tripwire kills 12-streak soup).
+
+### 0019 — line-repetition tripwire (2026-08-19, issue-fix P1-c)
+
+Trigger: issue-2 session 1cff1626 — "Lets reload."x60 inside ONE message
+(msg#750) with zero tool_use. Cross-message loops are client-domain, but
+the single-message repetition is server-side stoppable.
+
+Changes (TDD: `tdd_0019.py` R00-R09):
+- `scheduler.py`: `_dsv4_rep_lines()` — a short line (<=6 tokens, <=28 chars
+  prefilter) appearing >=5x in the new-token decode window; per-request
+  consecutive-block streak fires at `DSV4_REP_STREAK=6` -> drop this block's
+  tokens (floored at `_pre_len`, same finish-this-iteration invariant) +
+  FINISHED_STOPPED. Separator whitelist (`---`, `===`, ...); long lines never
+  flagged; 4 repeats never flagged. `DSV4_REPETITION_TRIPWIRE=0` disables.
+- New log line: `DSV4 0019 rep-tripwire`.
+
+Residual (honest boundary): cross-message loops (752 announce-only messages
+across turns) remain client-domain — the server cannot see cross-request
+session state.

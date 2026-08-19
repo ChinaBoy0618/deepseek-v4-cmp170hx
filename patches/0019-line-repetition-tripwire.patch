@@ -1,0 +1,84 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -171,6 +171,12 @@
+             and bool(self._dsv4_sig_first_ids)
+         )
+         self._dsv4_soup_streak = int(os.environ.get("DSV4_SOUP_STREAK", "12"))
++        # DSV4 0019: line-repetition tripwire knobs (issue-2 loops).
++        self._dsv4_rep_enabled = (
++            os.environ.get("DSV4_REPETITION_TRIPWIRE", "1") != "0"
++            and _tok is not None
++        )
++        self._dsv4_rep_streak = int(os.environ.get("DSV4_REP_STREAK", "6"))
+ 
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+@@ -2405,6 +2411,32 @@
+                 return k
+         return min(max_back, n)
+ 
++    _DSV4_REP_WHITELIST = frozenset({
++        "---", "===", "***", "___", "--", "==", "```", "---...",
++    })
++
++    def _dsv4_rep_lines(self, request: Request, new_token_ids) -> "str | None":
++        """DSV4 0019: the short line repeated >=5x in this block's decode
++        window, or None. Char-length prefilter (<=28) keeps the encode
++        check rare; separators whitelisted; long lines never flagged."""
++        _tok = getattr(self.structured_output_manager, "tokenizer", None)
++        if _tok is None:
++            return None
++        _win = request._output_token_ids[-(len(new_token_ids) + 16):]
++        if not _win:
++            return None
++        _txt = _tok.decode(_win)
++        _counts: dict[str, int] = {}
++        for _ln in _txt.splitlines():
++            _ln = _ln.strip()
++            if not _ln or len(_ln) > 28 or _ln in self._DSV4_REP_WHITELIST:
++                continue
++            _counts[_ln] = _counts.get(_ln, 0) + 1
++        for _ln, _n in _counts.items():
++            if _n >= 5 and len(_tok.encode(_ln, add_special_tokens=False)) <= 6:
++                return _ln
++        return None
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2557,6 +2589,35 @@
+                     _removed,
+                 )
+                 request.status = RequestStatus.FINISHED_STOPPED
++                request.resumable = False
++                return new_token_ids, True
++        # DSV4 0019: line-repetition tripwire (issue-2 announce-loops:
++        # "Lets reload."x60 / "Grep."xN inside ONE message). Cut is
++        # floored at _pre_len: drops only this block's tokens; request
++        # finishes this iteration so no future spec window sees the cut.
++        if not stopped and self._dsv4_rep_enabled:
++            _rep = self._dsv4_rep_lines(request, new_token_ids)
++            _rs = (getattr(request, "_dsv4_rep_streak", 0) + 1) if _rep else 0
++            request._dsv4_rep_streak = _rs
++            if _rs >= self._dsv4_rep_streak:
++                _out = request._output_token_ids
++                _removed = len(_out) - _pre_len
++                if _removed > 0:
++                    del _out[_pre_len:]
++                    del request._all_token_ids[
++                        request.num_prompt_tokens + _pre_len:
++                    ]
++                    del new_token_ids[0:]
++                logger.warning(
++                    "DSV4 0019 rep-tripwire for request %s: line %r "
++                    "repeated %s consecutive blocks, dropped %s tokens, "
++                    "finishing FINISHED_STOPPED.",
++                    request.request_id,
++                    _rep,
++                    _rs,
++                    _removed,
++                )
++                request.status = RequestStatus.FINISHED_STOPPED
+                 request.resumable = False
+                 return new_token_ids, True
+         return new_token_ids, stopped
