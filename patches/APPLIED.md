@@ -35,3 +35,5 @@ Log signatures (monitoring): "DSV4 0014 salvage-guard armed|salvage-cap hit|dege
 Validation state (2026-08-19 three-round battery): ctx 4.7K-498K 64/64 arms-pass, 24-turn agentic loop to 162K clean, 20-tool schemas clean, hammer 200/200, soak 1399/1400 (1 client-side transient, server zero non-200), 612=0, TYPE-B=0, salvage=0, crashes=0.
 
 Issue-replay state (2026-08-19 late, 0019v2 stack): verbatim issue-1/2 poison replay (i1 x4/i1t/i2, temp 1.0) zero errors, think_leak=0, soup cumulative fired correctly, rep-tripwire 9/20 induction + 0 false kills on 3/3 probes, hammer 200/200. One stochastic crash 11:42 (0010 OOV sentinel first-fire -> PP3 device assert): not reproduced in 60 poisoned requests, see README incident notes.
+
+0020 stack (2026-08-19 night, post verify-clamp): full replay zero errors zero crashes, rep-tripwire firing correctly, hammer 200/200, probes 3/3, spec acceptance length 3.2-4.2 (healthy), Out-of-vocab=0, EngineDead=0.
