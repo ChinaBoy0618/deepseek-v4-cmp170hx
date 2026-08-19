@@ -1,0 +1,29 @@
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -76,6 +76,8 @@
+     ):
+         self.sampler = sampler
+         self.num_speculative_steps = spec_config.num_speculative_tokens
++        # DSV4 0020: bound for clamping the verify kernel's sampled ids.
++        self._dsv4_vocab_limit = sampler.sampling_states.vocab_size - 1
+         rejection_sample_method = spec_config.rejection_sample_method
+         self.use_block_verification: bool = False
+         self.synthetic_conditional_rates: torch.Tensor | None = None
+@@ -162,6 +164,17 @@
+             use_fp64=self.sampler.use_fp64_gumbel,
+             use_block_verification=self.use_block_verification,
+         )
++        # DSV4 0020: a degraded verify block can carry the vocab_size
++        # sentinel (or garbage) out of the kernel; the worker commits
++        # sampled tokens to req_state before the scheduler can react, so
++        # the next embedding lookup device-asserts (2026-08-19 11:42
++        # engine death). Clamp in place BEFORE the logprobs flatten reads
++        # it: a leak degrades this one token instead of killing all ranks.
++        _lim = getattr(self, "_dsv4_vocab_limit", None)
++        if _lim is None:
++            _lim = self.sampler.sampling_states.vocab_size - 1
++            self._dsv4_vocab_limit = _lim
++        sampled = sampled.clamp_(min=0, max=_lim)
+         return processed_logits, sampled, num_sampled
+ 
+     def _verify_in_chunks(
