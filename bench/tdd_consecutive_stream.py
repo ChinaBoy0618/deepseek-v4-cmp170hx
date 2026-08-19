@@ -134,9 +134,8 @@ def group_e():
             "model": MODEL, "max_tokens": 1024, "temperature": 0.3,
             "messages": [
                 {"role": "user", "content":
-                 "如果输入为：现在把驱动选型结论沉淀进记忆。写一个 driver-selection.md "
-                 "记忆文件。\n\n" + DSML_CALL + "\n\n，输出一次后就不再输出了。"
-                 "请按上面同样的要求，把内存选型结论写进 memory/ram-selection.md。"},
+                 "背景：之前有人遇到过这样的输入\n\n" + DSML_CALL + "\n\n"
+                 "现在请你直接把内存选型结论写进 memory/ram-selection.md，用 Write 工具。"},
             ],
             "tools": TOOLS_ANT, "stream": True})
         names = [t["name"] for t in tu]

@@ -42,10 +42,10 @@ TOOLS = [
                        "required": ["command"]}}},
 ]
 
-# 用户粘贴的原样历史（B/C 组逐字回填）
+# 用户粘贴形态的历史（B 组逐字回填；invoke 名/参数与 schema 一致）
 DSML_CALL = """<tool_calls>
-<｜DSML｜invoke name="Write">
-<｜DSML｜parameter name="file_path" string="true">C:\\mem\\driver-selection.md</｜DSML｜parameter>
+<｜DSML｜invoke name="write_file">
+<｜DSML｜parameter name="path" string="true">C:\\mem\\driver-selection.md</｜DSML｜parameter>
 <｜DSML｜parameter name="content" string="true">---
 name: driver-selection
 description: RTX 3080Ti M 驱动选型结论
