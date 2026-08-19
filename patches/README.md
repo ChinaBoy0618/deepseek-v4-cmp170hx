@@ -457,3 +457,131 @@ truncations unchanged (that is the correct commit-time mechanism).
 Validation (0016 canary): ctx matrix 60/60, hammer 200/200, 612 count 0,
 TYPE-A still present and correct, induced-soup tripwire still fires,
 tuple-echo still passes.
+
+### 0017 — soup signature extension + cap-hit clean boundary (2026-08-19, issue-fix P0)
+
+Trigger: the two 2026-08-19 issue sessions (`issues/01` 73db6fa4 XML pseudo-tag
+leak, `issues/02` 1cff1626 meta-tag forge) showed the 0015 signature table
+blind to a whole new generation of hallucinated tags — in the issue-1 window
+TYPE-B salvage fired 30x with 8 cap-hits, while `degenerate-signature` and
+`soup-tripwire` stayed at **0** (`<Write `, `<bash_command`, `<call Bash`,
+`<answer>`, `<analyze>`, `<thinking>` all leaked through). The `</Bash>` mid-tag
+hard stop was our own 0014 cap-hit landing mid-tag.
+
+Changes (TDD: `tdd_0017.py` U03/U10/U14/U20-U28 RED -> GREEN):
+- **P0-a**: 9 new signatures in `_DSV4_SIG_STRINGS` — `<Write `, `<bash_command`,
+  `<call `, `<answer>`, `<analyze>`, `<thinking>`, `</assistant>`,
+  `<assistant_unitsummary>`, `<system-reminder>`. All output-side-only
+  hallucinations, zero intersection with the DSML legit syntax set and
+  `<think>`/`</think>` (the 0015-v2 lesson); trailing space on `<call `/`<Write `
+  guards `<callable`/`<Writer`; one-shot legit mentions survive streak-12.
+- **P0-b**: new `Scheduler._dsv4_clean_cut(out_tail, decode, max_back=16)` —
+  when the 0014 salvage-cap hit lands inside a half-written tag, back the cut up
+  to the last unclosed `<` (bounded 16 tokens; `a < b` prose/math never
+  triggers; closed tags untouched). Wired into the cap-hit branch before
+  FINISHED_STOPPED with the same finish-this-iteration trim invariant as
+  0013 TYPE-A / 0014 C'.
+
+New log lines: `DSV4 0017 salvage-cap clean-cut`.
+
+Validation: unit suite 19/19 in-container (real Scheduler + real tokenizer);
+live poisoned-replay pre-fix tripwire-delta 0 / 3-of-20 requests leaked 5+
+pseudo-tags uncut -> post-fix fires + tails cut; legit-literal probes
+no-false-kill; hammer regression 200/200.
+
+### 0018 — `<thinking>` hallucinated-variant absorption (2026-08-19, issue-fix P1-a)
+
+Trigger: issue-1 session 73db6fa4 showed `<thinking>`/`</thinking>` 99/96
+times in VISIBLE text — the deepseek_v4 reasoning parser only knows
+`<think>`/`</think>`, so the hallucinated variant flowed into content.
+
+Changes (TDD: `tdd_0018.py` V1-V4 RED -> GREEN, V5-V7 stay GREEN):
+- `vllm/parser/deepseek_v4.py`: new terminals `THINK_START_V`/`THINK_END_V`
+  (`<thinking>`/`</thinking>`, text + token-id) with pure-absorb transitions
+  in CONTENT and REASONING states (no events, no state change).
+- **Strip-only by design**: an unclosed variant inside a legit document
+  cannot route the rest of the output into reasoning_content (the trap that
+  routing-to-reasoning would create); inner text stays visible, tags vanish.
+  Cross-pairs (`<think>` ... `</thinking>`) are handled since both closes
+  are recognized.
+- The 0017 scheduler-side `<thinking>` signature stays as the soup backstop
+  (parser strips in normal traffic; tripwire kills 12-streak soup).
+
+### 0019 — line-repetition tripwire (2026-08-19, issue-fix P1-c)
+
+Trigger: issue-2 session 1cff1626 — "Lets reload."x60 inside ONE message
+(msg#750) with zero tool_use. Cross-message loops are client-domain, but
+the single-message repetition is server-side stoppable.
+
+Changes (TDD: `tdd_0019.py` R00-R09):
+- `scheduler.py`: `_dsv4_rep_lines()` — a short line (<=6 tokens, <=28 chars
+  prefilter) appearing >=5x in the new-token decode window; per-request
+  consecutive-block streak fires at `DSV4_REP_STREAK=6` -> drop this block's
+  tokens (floored at `_pre_len`, same finish-this-iteration invariant) +
+  FINISHED_STOPPED. Separator whitelist (`---`, `===`, ...); long lines never
+  flagged; 4 repeats never flagged. `DSV4_REPETITION_TRIPWIRE=0` disables.
+- New log line: `DSV4 0019 rep-tripwire`.
+
+Residual (honest boundary): cross-message loops (752 announce-only messages
+across turns) remain client-domain — the server cannot see cross-request
+session state.
+
+### 0017v2 — soup tripwire cumulative totals (2026-08-19, live-TDD finding)
+
+The first live run of the extended table exposed a semantics gap: the issue-1
+replay emits pseudo-tags SPARSELY (~1 per 50 tokens), and the 0015
+consecutive-streak rule (same signature in the 22-token window 12 blocks in a
+row) can never saturate — window residency per occurrence is only ~3 blocks.
+Table hits with zero fires.
+
+- `scheduler.py`: per-request `_dsv4_sig_totals` cumulative detection-block
+  counters; fire when `streak >= 12 OR total >= DSV4_SOUP_TOTAL (18)`
+  (~6-8 sparse occurrences; legit discussion docs with <=4 mentions stay
+  far below). Log line now reports `streak N total M`.
+- TDD: `tdd_0017.py` U15 (12 sparse occurrences fire) / U16 (4 legit
+  mentions never fire) / U17 (one-shot never fires).
+- Apply order note: 0017 -> 0018 -> 0019 -> 0017v2 (v2 was written after
+  0019 on the live tree; patch boundaries follow the backup chain
+  `.bak-0019`/`.bak-0017v2`).
+
+### 0019v2 — repetition window floor (2026-08-19, live-TDD finding)
+
+Same lesson as 0017v1, found in the issue-2 replay: `_dsv4_rep_lines` used
+the 0015-style window (`new_token_ids + 16` overlap ~= 21 tokens at spec=5).
+A repeated short line is ~4-6 tokens, so 5 occurrences need 25-30 tokens —
+and the sliding window boundary truncates one occurrence mid-line, capping
+the count at 4. Unit suite was green (big blocks) but the tripwire was DEAD
+in production: i2 replay produced dup>=5 responses with zero fires.
+
+- `scheduler.py`: window floor `max(new+16, DSV4_REP_WINDOW=160)` so the
+  count sees a stable trailing region; streak-6 rule unchanged. Legit
+  parked duplicates stop firing as soon as the line scrolls out (same
+  semantics as 0015 soup window).
+- TDD: `tdd_0019v2.py` — W02 (exact live shape: 5-token decode blocks,
+  consecutive repeats fire) RED on v1, GREEN after; W03-W07 guards (3-4
+  sparse/interleaved mentions, separators, long lines, table rows) stay
+  green before AND after.
+
+### Issue-replay validation + crash incident (2026-08-19 11:42)
+
+User-directed verbatim replay (`bench/tdd_issue_replay.py`): issue-1
+pseudo-tag transcript and issue-2 Lets-reload loop through the live
+service at temp 1.0.
+
+Results on the 0017v2+0018+0019 stack:
+- think_leak = 0 everywhere (0018 strip works live, incl. tools group).
+- 0017v2 cumulative soup fired twice correctly (`</assistant>` total 18,
+  `<answer>` total 18; trimmed 2-3 tokens, FINISHED_STOPPED).
+- **Crash 11:42:26** during i1 round 1 request #11: `Out-of-vocab token
+  129280 (=vocab_size)` — the 0010 guard firing for the FIRST time in
+  container history — then PP3 (drafter rank) CUDA device-side assert ->
+  EngineDead, container exit. Same class as the 08-18 crash (degraded
+  DSpark draft stream surfaces the sentinel token; scheduler guard errors
+  the request but the worker-side embedding lookup is already in flight).
+  None of the 0017-0019 fire paths executed near the crash; they touch
+  neither drafter nor sampler. Full log: 760:/tmp/dsv4-crash-0819-1142.log.
+- Reproduction: NOT reproduced — after restart, i1 x3 (36 req incl. the
+  same request index), i1t (12), i2 (12) all clean; zero Out-of-vocab,
+  zero crash. Classified stochastic residual of the known drafter hole;
+  hammer 200/200 re-verified post-restart. Hardening (worker-side clamp)
+  stays on the 0012 backlog as 0020 candidate if it recurs.

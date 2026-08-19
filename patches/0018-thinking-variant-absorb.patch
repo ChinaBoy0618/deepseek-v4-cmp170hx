@@ -1,0 +1,58 @@
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -42,6 +42,12 @@
+ 
+ DSML_THINK_START = "<think>"
+ DSML_THINK_END = "</think>"
++# DSV4 0018: hallucinated variant observed 99x in the 2026-08-19
++# issue-1 session. Strip-only (absorbed, no state change) so an
++# unclosed variant inside a legit document cannot route the rest
++# of the output into reasoning_content.
++DSML_THINK_START_V = "<thinking>"
++DSML_THINK_END_V = "</thinking>"
+ DSML_TOOL_START = f"<{_DSML}tool_calls>"
+ DSML_TOOL_END = f"</{_DSML}tool_calls>"
+ DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
+@@ -138,6 +144,8 @@
+         terminals={
+             "THINK_START": DSML_THINK_START,
+             "THINK_END": DSML_THINK_END,
++            "THINK_START_V": DSML_THINK_START_V,
++            "THINK_END_V": DSML_THINK_END_V,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
+             "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
+@@ -150,6 +158,8 @@
+         token_id_terminals={
+             "THINK_START": DSML_THINK_START,
+             "THINK_END": DSML_THINK_END,
++            "THINK_START_V": DSML_THINK_START_V,
++            "THINK_END_V": DSML_THINK_END_V,
+             "TOOL_START": DSML_TOOL_START,
+             "TOOL_END": DSML_TOOL_END,
+             "TOOL_START_LENIENT": DSML_TOOL_START_LENIENT,
+@@ -170,6 +180,24 @@
+                 ParserState.REASONING,
+                 (),
+             ),
++            # DSV4 0018: <thinking>/</thinking> hallucinated variants —
++            # pure absorb, no events, no state change in either state.
++            (ParserState.CONTENT, "THINK_START_V"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
++            (ParserState.CONTENT, "THINK_END_V"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
++            (ParserState.REASONING, "THINK_START_V"): Transition(
++                ParserState.REASONING,
++                (),
++            ),
++            (ParserState.REASONING, "THINK_END_V"): Transition(
++                ParserState.REASONING,
++                (),
++            ),
+             (ParserState.REASONING, "THINK_END"): Transition(
+                 ParserState.CONTENT,
+                 (EventType.REASONING_END,),

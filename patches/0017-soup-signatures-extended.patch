@@ -1,0 +1,101 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -85,6 +85,20 @@
+         "<edit-path",
+         "<source>placeholder",
+         "<original_output",
++        # DSV4 0017 P0-a: pseudo-tags observed in the 2026-08-19 issue
++        # sessions (73db6fa4 XML leak / 1cff1626 meta-tag forge).
++        # Output-side hallucinations only -- zero intersection with the
++        # legit DSML syntax set or <think>/</think> (tdd U04/U05);
++        # one-shot legit mentions survive the streak-12 semantics.
++        "<Write ",
++        "<bash_command",
++        "<call ",
++        "<answer>",
++        "<analyze>",
++        "<thinking>",
++        "</assistant>",
++        "<assistant_unitsummary>",
++        "<system-reminder>",
+     )
+ 
+     def __init__(
+@@ -2362,6 +2376,35 @@
+         _txt = _tok.decode(_win)
+         return {_s for _s in self._DSV4_SIG_STRINGS if _s in _txt}
+ 
++    def _dsv4_clean_cut(self, out_tail, decode, max_back: int = 16) -> int:
++        """DSV4 0017 P0-b: how many trailing tokens to drop so the visible
++        text does not end inside a half-written tag fragment. Fires only
++        when the decoded tail ends in an unclosed '<' + tagname run (no
++        '>' after the last '<', tagname starts alpha or '/'), so 'a < b'
++        math/prose never triggers. Bounded by max_back tokens."""
++        n = len(out_tail)
++        if n == 0:
++            return 0
++        txt = decode(out_tail[-min(n, 64):])
++        lt = txt.rfind("<")
++        if lt < 0:
++            return 0
++        after = txt[lt + 1:]
++        if not after:
++            return min(1, max_back)  # bare trailing '<'
++        if ">" in after:
++            return 0  # tag closed -> clean boundary
++        first = after[0]
++        if not (first.isalpha() or first == "/"):
++            return 0  # '< ' + space == not a tag start
++        if len(after) > 64:
++            return 0  # implausible fragment, leave it
++        need = len(txt) - lt  # chars from '<' to end of tail
++        for k in range(1, min(max_back, n) + 1):
++            if len(decode(out_tail[-k:])) >= need:
++                return k
++        return min(max_back, n)
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+     ) -> tuple[list[int], bool]:
+@@ -2391,6 +2434,41 @@
+                     _budget -= 1
+                     request._dsv4_post_salvage_budget = _budget
+                     if _budget < 0:
++                        # DSV4 0017 P0-b: back the cut up to the last
++                        # unclosed '<' so the stream does not end
++                        # mid-tag (bounded 16 tokens; same
++                        # finish-this-iteration invariant as C'/TYPE-A).
++                        _out_t = request._output_token_ids
++                        _drop_n = 0
++                        if len(_out_t) > _pre_len:
++                            _tokm = getattr(
++                                self.structured_output_manager,
++                                "tokenizer",
++                                None,
++                            )
++                            if _tokm is not None:
++                                _drop_n = self._dsv4_clean_cut(
++                                    _out_t[-64:], _tokm.decode, 16
++                                )
++                                _drop_n = min(
++                                    _drop_n, len(_out_t) - _pre_len
++                                )
++                        if _drop_n > 0:
++                            _cutc = len(_out_t) - _drop_n
++                            del _out_t[_cutc:]
++                            del request._all_token_ids[
++                                request.num_prompt_tokens + _cutc:
++                            ]
++                            if _cutc - _pre_len < len(new_token_ids):
++                                del new_token_ids[
++                                    max(0, _cutc - _pre_len):
++                                ]
++                            logger.warning(
++                                "DSV4 0017 salvage-cap clean-cut for %s: "
++                                "dropped %s mid-tag tail tokens.",
++                                request.request_id,
++                                _drop_n,
++                            )
+                         logger.warning(
+                             "DSV4 0014 salvage-cap hit for request %s: "
+                             "finishing FINISHED_STOPPED after the "
