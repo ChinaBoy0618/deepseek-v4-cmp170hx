@@ -613,3 +613,38 @@ remaining unguarded surface.
   sentinel at the crash shape. V01/V02/V03/V05 RED on unpatched, GREEN
   after; V04 (clean ids never over-clamped) green before and after;
   tdd_0017/0019/0019v2 regressions green in the recreated container.
+
+### 0021 — raw-DSML history normalization (2026-08-19 night, user report)
+
+User report: "tool_call 输出一次后就不再输出" — after one tool call, the
+model stops emitting them. Consecutive-ability tests
+(`bench/tdd_consecutive_tools.py` A/B/C + `tdd_consecutive_stream.py`
+D/E) isolated the exact surface:
+
+- Structured loops are healthy: A (OAI multi-turn agent loop, tool
+  results fed back) 3/3, C (/v1/messages continuation) 3/3, D (streaming
+  two-step) 6/6.
+- RAW-DSML history is not: when the assistant tool call comes back as
+  raw TEXT in `content` — client-echoed `<tool_calls>` wrapper, canonical
+  `<｜DSML｜tool_calls>`, or the lenient variant — `render_message` emits
+  it as plain text; the model then treats the turn as answered-in-text
+  and skips the next call (B 1/3, E 2/3 live).
+
+Root: `deepseek_v4_encoding.render_message` only renders structured
+`tool_calls` through the canonical invoke template; nothing normalized
+raw DSML text in incoming history.
+
+- `tokenizers/deepseek_v4_encoding.py`: `extract_dsml_tool_calls()` —
+  regex-lifts COMPLETE DSML tool-call blocks (all three wrapper variants,
+  `string="true|false"` params, JSON values parsed) from assistant
+  content into structured tool_calls; unbalanced prose mentions stay
+  text (guard). Hooked into `encode_messages` preprocessing for both
+  `messages` and `context`. Normalized history renders byte-identically
+  to the structured control path.
+- `launch/run-pp-dspark.sh`: `tokenizers/deepseek_v4_encoding.py` added
+  to the bind-mount list (not previously mounted).
+- TDD: `bench/tdd_0021.py` — U02/U07/U09 assert byte-for-byte equality
+  with the structured control rendering; U01/U03/U06 wrapper variants;
+  U04/U05/U08/U10 guards (structured control, prose mention, no-tools,
+  no caller mutation). RED 6 before, ALL GREEN after; tdd_0017/0019/
+  0019v2/0020 regressions green in the recreated container.
