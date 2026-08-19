@@ -457,3 +457,34 @@ truncations unchanged (that is the correct commit-time mechanism).
 Validation (0016 canary): ctx matrix 60/60, hammer 200/200, 612 count 0,
 TYPE-A still present and correct, induced-soup tripwire still fires,
 tuple-echo still passes.
+
+### 0017 — soup signature extension + cap-hit clean boundary (2026-08-19, issue-fix P0)
+
+Trigger: the two 2026-08-19 issue sessions (`issues/01` 73db6fa4 XML pseudo-tag
+leak, `issues/02` 1cff1626 meta-tag forge) showed the 0015 signature table
+blind to a whole new generation of hallucinated tags — in the issue-1 window
+TYPE-B salvage fired 30x with 8 cap-hits, while `degenerate-signature` and
+`soup-tripwire` stayed at **0** (`<Write `, `<bash_command`, `<call Bash`,
+`<answer>`, `<analyze>`, `<thinking>` all leaked through). The `</Bash>` mid-tag
+hard stop was our own 0014 cap-hit landing mid-tag.
+
+Changes (TDD: `tdd_0017.py` U03/U10/U14/U20-U28 RED -> GREEN):
+- **P0-a**: 9 new signatures in `_DSV4_SIG_STRINGS` — `<Write `, `<bash_command`,
+  `<call `, `<answer>`, `<analyze>`, `<thinking>`, `</assistant>`,
+  `<assistant_unitsummary>`, `<system-reminder>`. All output-side-only
+  hallucinations, zero intersection with the DSML legit syntax set and
+  `<think>`/`</think>` (the 0015-v2 lesson); trailing space on `<call `/`<Write `
+  guards `<callable`/`<Writer`; one-shot legit mentions survive streak-12.
+- **P0-b**: new `Scheduler._dsv4_clean_cut(out_tail, decode, max_back=16)` —
+  when the 0014 salvage-cap hit lands inside a half-written tag, back the cut up
+  to the last unclosed `<` (bounded 16 tokens; `a < b` prose/math never
+  triggers; closed tags untouched). Wired into the cap-hit branch before
+  FINISHED_STOPPED with the same finish-this-iteration trim invariant as
+  0013 TYPE-A / 0014 C'.
+
+New log lines: `DSV4 0017 salvage-cap clean-cut`.
+
+Validation: unit suite 19/19 in-container (real Scheduler + real tokenizer);
+live poisoned-replay pre-fix tripwire-delta 0 / 3-of-20 requests leaked 5+
+pseudo-tags uncut -> post-fix fires + tails cut; legit-literal probes
+no-false-kill; hammer regression 200/200.
