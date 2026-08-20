@@ -122,11 +122,11 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   -v $CACHE_DIR:/root/.cache \
   -v "$MODEL":/model \
   $MOUNTS \
-  --shm-size=16g -p ${DSV4_PORT:-8098}:8000 \
+  --shm-size=64g -p ${DSV4_PORT:-8098}:8000 \
   "$IMG" vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 --kv-cache-dtype fp8 --block-size 256 \
   --max-model-len "$MAXLEN" --max-num-batched-tokens 2048 --trust-remote-code \
-  --gpu-memory-utilization 0.85 --max-num-seqs 8 \
+  --gpu-memory-utilization 0.85 --max-num-seqs 16 \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --reasoning-parser deepseek_v4 \
