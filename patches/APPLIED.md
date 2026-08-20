@@ -78,3 +78,28 @@ delta + finish=tool_calls; no-tools -> no flags. Tripwire live-fired:
 budget-cut probe (tools+auto, max_tokens=12) -> response dsv4_flags=
 ["budget_burn"] + WARNING "DSV4 0022 envelope-missing" in server log. All
 0024 knobs remain OFF pending A/B. Rollback: cp *.bak-002N back + relaunch.
+
+## 0025 typeb-finish (STAGED, not deployed — 2026-08-20)
+
+Implemented for the live reasonix incident (F3b). Root cause chain reproduced
+deterministically (phase0 L arm + single-probe): TYPE-B (grammar rejects a
+spec token, FSM still live) -> 0013 commits block unconstrained -> 0014 arms
+64-token salvage -> unconstrained tail re-emits MALFORMED DSML envelope
+(`<｜DSML｜tool_calls<invoke` missing ｜DSML｜) -> salvage-cap FINISHED_STOPPED
+mid-args -> raw content leaks, finish=stop, 0022 pseudo_tag. Phase0 L on the
+0022-0024 stack: L-W2k/L-W8k 3x NO_TOOL_STOP+pseudo_tag; L-W32k 2x FAIL_0023
+(args > max_tokens — client chunking, out of scope); Bash arms all OK.
+
+| # | patch | files | purpose | env knobs |
+|---|-------|-------|---------|-----------|
+| 0025 | typeb-finish (F3b) | v1/core/scheduler.py, .../chat_completion/serving.py | DSV4_TYPEB_POLICY=finish: on TYPE-B keep only the FSM-accepted prefix and finish the request this iteration (TYPE-A semantics — desync-safe, no future spec window); client gets a clean retryable cut instead of a malformed-envelope tail. Default commit = exact 0014 behavior. serving.py: new `typeb_cut` flag (proper `<｜DSML｜tool_calls>` opener without closer) distinguished from `pseudo_tag` garbage | DSV4_TYPEB_POLICY={commit,finish} (default commit — deploy alone is a no-op until set to finish at launch) |
+
+Local validation: py_compile both; _dsv4_0022_flags unit battery 8/8
+(typeb_cut vs pseudo_tag vs budget_burn vs closed-envelope); patch -p1 on
+pristine live baselines reproduces target md5s (scheduler c4b15fcb…,
+serving fac70e0d…); default-policy path is byte-identical behavior.
+
+Deploy: patch -p1 on 760T tree (baselines = live 201120d3… scheduler /
+ba11e046… serving), relaunch WITH `DSV4_TYPEB_POLICY=finish` in env
+(plus DSV4_PORT=5700 DSV4_MAXLEN=524288), then re-run phase0 L arm —
+expect NO_TOOL_STOP+pseudo_tag -> TYPEB_CUT (clean prefix) or TOOL_OK.
