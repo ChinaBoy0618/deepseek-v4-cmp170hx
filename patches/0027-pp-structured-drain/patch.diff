@@ -1,0 +1,203 @@
+--- a/vllm/v1/core/sched/interface.py
++++ b/vllm/v1/core/sched/interface.py
+@@ -195,6 +195,17 @@
+         not yet returned in SchedulerOutputs."""
+         return self.has_unfinished_requests() or self.has_finished_requests()
+ 
++    def has_structured_output_in_flight(
++        self, scheduler_output: "SchedulerOutput"
++    ) -> bool:
++        """Returns True if any structured-output request scheduled in
++        `scheduler_output` still has a previously scheduled token in flight,
++        i.e. its grammar FSM has not yet caught up. Used under pipeline
++        parallelism to decide whether in-flight batches must be drained before
++        computing the next grammar bitmask. Defaults to False for schedulers
++        that do not track in-flight output tokens."""
++        return False
++
+     @property
+     @abstractmethod
+     def pause_state(self) -> PauseState:
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1427,6 +1427,19 @@
+             scheduler_output.has_structured_output_requests |= (
+                 request.use_structured_output and not request.is_prefill_chunk
+             )
++            # DSv4-0027: defer grammar-bitmask sampling while older batches
++            # still carry this request's positions (its FSM is stale until
++            # they are processed; a bitmask built now would be wrong under
++            # PP, #45014/#45015). num_in_flight_tokens already includes THIS
++            # batch's share (incremented above), so strictly-greater means
++            # older undelivered positions. Sync-native: no placeholder
++            # bookkeeping (num_output_placeholders stays 0 — six other
++            # scheduler paths read it and have never seen it nonzero here).
++            scheduler_output.pending_structured_output_tokens |= (
++                request.use_structured_output
++                and not request.is_prefill_chunk
++                and request.num_in_flight_tokens > num_scheduled_token
++            )
+             # Drop from the in-flight-prefill set once it's no longer prefilling.
+             if not request.is_prefill_chunk:
+                 self._inflight_prefills.discard(request)
+@@ -3011,6 +3024,38 @@
+             )
+         )
+ 
++    def has_structured_output_in_flight(
++        self, scheduler_output: SchedulerOutput
++    ) -> bool:
++        # DSv4-0027: port of buliaoyin 6e959b2 / vllm#45015. True while a
++        # structured request scheduled in `scheduler_output` still has token
++        # positions in older in-flight batches: its grammar FSM only advances
++        # in update_from_output, so a bitmask built now would be stale and
++        # wrong under PP (batch_queue depth = pp_size = 4).
++        #
++        # Criterion: num_in_flight_tokens > this batch's own share. It is
++        # incremented at schedule time and decremented per batch at delivery,
++        # exactly mirrored, and carries stale shares through preemption in
++        # lockstep — so strictly-greater means older, still-undelivered
++        # positions. num_output_placeholders is deliberately NOT used: the
++        # sync scheduler never increments it (async-only), and waking it
++        # changes dormant scheduling arithmetic (num_new_tokens,
++        # is_prefill_chunk, max_tokens skip) that has never run nonzero here.
++        if self.use_v2_model_runner:
++            return False
++
++        for req_id, own_share in scheduler_output.num_scheduled_tokens.items():
++            request = self.requests.get(req_id)
++            if (
++                request is not None
++                and request.use_structured_output
++                and not request.is_prefill_chunk
++                and request.num_in_flight_tokens > own_share
++            ):
++                return True
++        return False
++
++
+     def reset_prefix_cache(
+         self, reset_running_requests: bool = False, reset_connector: bool = False
+     ) -> bool:
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -100,6 +100,28 @@
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++def _merge_engine_core_outputs(
++    dst: dict[int, "EngineCoreOutputs"], src: dict[int, "EngineCoreOutputs"]
++) -> None:
++    # DSv4-0027: port of buliaoyin 6e959b2 / vllm#45015 — merge the drained
++    # batches' outputs into the step's result.
++    for client_index, out in src.items():
++        cur = dst.get(client_index)
++        if cur is None:
++            dst[client_index] = out
++            continue
++        cur.outputs.extend(out.outputs)
++        if out.finished_requests:
++            if cur.finished_requests:
++                cur.finished_requests |= out.finished_requests
++            else:
++                cur.finished_requests = out.finished_requests
++        if out.scheduler_stats is not None:
++            cur.scheduler_stats = out.scheduler_stats
++
++
++
++
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
+@@ -622,6 +644,37 @@
+             if draft_token_ids is not None:
+                 self.scheduler.update_draft_token_ids(draft_token_ids)
+ 
++    def _pop_and_process_batch(
++        self,
++        batch_queue: (
++            "deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]"
++        ),
++    ) -> dict[int, EngineCoreOutputs]:
++        """DSv4-0027: pop the oldest in-flight batch, wait for its result, and
++        update the scheduler from it (refactored out of step_with_batch_queue
++        so the PP structured-output drain can reuse it)."""
++        future, scheduler_output, exec_model_fut = batch_queue.pop()
++        with (
++            self.capture_iteration_details(scheduler_output) as iteration_details,
++            self.log_error_detail(scheduler_output),
++        ):
++            model_output = future.result()
++            if model_output is None:
++                # None from sample_tokens() implies that the original execute_model()
++                # call failed - raise that exception.
++                exec_model_fut.result()
++                raise RuntimeError("unexpected error")
++
++        # Before processing the model output, process any aborts that happened
++        # during the model execution.
++        self._process_aborts_queue()
++        engine_core_outputs = self.scheduler.update_from_output(
++            scheduler_output, model_output
++        )
++        self._attach_iteration_details(engine_core_outputs, iteration_details)
++        return engine_core_outputs
++
++
+     def step_with_batch_queue(
+         self,
+     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+@@ -692,31 +745,33 @@
+             # is non-empty.
+             return None, False
+ 
+-        # Block until the next result is available.
+-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+-        with (
+-            self.capture_iteration_details(scheduler_output) as iteration_details,
+-            self.log_error_detail(scheduler_output),
+-        ):
+-            model_output = future.result()
+-            if model_output is None:
+-                # None from sample_tokens() implies that the original execute_model()
+-                # call failed - raise that exception.
+-                exec_model_fut.result()
+-                raise RuntimeError("unexpected error")
+-
+-        # Before processing the model output, process any aborts that happened
+-        # during the model execution.
+-        self._process_aborts_queue()
+-        engine_core_outputs = self.scheduler.update_from_output(
+-            scheduler_output, model_output
++        # Block until the next result is available. DSv4-0027: the guard is
++        # defensive — the deferred branch reaches this pop without having
++        # appended its own batch, and must not crash the engine if the queue
++        # is already empty (0820 v1 incident: IndexError pop-from-empty-deque).
++        engine_core_outputs = (
++            self._pop_and_process_batch(batch_queue) if batch_queue else {}
+         )
+-        self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+         # re-called. The latter slightly favors TTFT over TPOT/throughput.
+         if deferred_scheduler_output:
++            # DSv4-0027: PP + structured outputs — the single result processed
++            # above only advances each structured request's grammar FSM by
++            # ~one step. Fine when pp_size == 1 (the FSM lags by at most one
++            # in-flight token), but with pp_size > 1 the previous token can be
++            # several batches deep, so the FSM would still be stale and the
++            # bitmask wrong. Drain the queue until those requests are caught
++            # up (#45014). Exiting because the queue is EMPTY is legitimate
++            # (trivially caught up), so there is no post-drain assert.
++            while batch_queue and self.scheduler.has_structured_output_in_flight(
++                deferred_scheduler_output
++            ):
++                _merge_engine_core_outputs(
++                    engine_core_outputs,
++                    self._pop_and_process_batch(batch_queue),
++                )
+             # When draft tokens are used with structured output, validate them
+             # before computing the grammar bitmask for the deferred request.
+             if self.check_for_draft_tokens:

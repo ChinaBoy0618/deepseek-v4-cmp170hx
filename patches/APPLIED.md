@@ -1,6 +1,6 @@
 # PATCH.md — applied patch stack on this checkout (vllm-c3046d1)
 
-Updated: 2026-08-19 20:05 +0800 (canary @5700 running this tree through 0019)
+Updated: 2026-08-21 02:45 +0800 (prod @5700 on 0027v2, TYPEB=commit)
 
 Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 
@@ -23,6 +23,7 @@ Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 | 0019v2 | repetition window floor | scheduler.py | max(new+16, DSV4_REP_WINDOW=160) — 21-token window could never hold 5 occurrences at spec=5 block sizes (live-TDD finding) |
 | 0020 | verify-output vocab clamp | rejection_sampler.py (+launch mount) | sampled.clamp_ after rejection_sample — OOB sentinel degrades one token instead of PP-wide embedding assert; closes the 0819-1142 crash path |
 | 0021 | raw-DSML history normalization | tokenizers/deepseek_v4_encoding.py (+launch mount) | extract COMPLETE DSML tool-call blocks from assistant content into structured tool_calls; raw-echo history renders canonically -> consecutive tool calls keep working (user-reported loop stall) |
+| 0027v2 | PP structured-output drain | v1/core/sched/{interface,scheduler}.py, v1/engine/core.py (+launch mounts for interface/core) | port of buliaoyin 6e959b2 / vllm#45015 queue-drain, adapted to sync Scheduler: in-flight-token criterion, defer+drain grammar bitmask sampling until older batches processed; v1 (ph-based) was live-crashed 0820 and replaced same day — see patches/0027-pp-structured-drain/PATCH.md |
 
 Backups on this tree: *.bak-<patch#> beside each patched file
 (scheduler.py.bak-0019v2 / deepseek_v4.py.bak-0018 are the immediate rollback points;
@@ -145,3 +146,24 @@ Post-deploy A/B validation runs automatically via `tmp/0025-relaunch-and-verify.
 poll /v1/models until 200, then smoke (nonstream tools call) + phase0
 L arm rerun → tmp/reports/phase0-0025.jsonl. Watchdog at
 `/tmp/watchdog_5700.sh` already extended with `env0022` + `tbfin` columns.
+
+## 0027 deploy + validation (2026-08-21, live on 760T :5700)
+
+v1 (AsyncScheduler ph-bookkeeping mirror) crashed live at 17:32 (IndexError
+pop-from-empty-deque at the deferred main pop; also empty-content responses
+from corrupted scheduling arithmetic — ph is load-bearing in 6 dormant sync
+paths). v2 (in-flight-token criterion) applied same evening, tdd 20/20,
+all regression suites PASS, hammer 200/200, prod relaunched on v2.
+
+- A/B battery (bench/battery_0027.py, 3x8 concurrent json_schema):
+  pre-0027 17/24, 17/24 — v2 18/24. No regression, no measurable gain;
+  residual concurrent corruption is the pre-existing TYPE-B/0008-salvage
+  path ("abandoning structured-output enforcement and committing the block
+  unchanged"), NOT stale-FSM. Follow-up candidate for 0028.
+- DSV4_TYPEB_POLICY reverted to commit (default): finish-mode truncates
+  concurrent response_format to the `{`-prefix (1/8 valid). The pending
+  0025 finish A/B must scope finish to the DSML tool path or reconsider.
+- Backups .bak-0027 beside all 3 files; patch.diff regenerated from baks.
+- Authoritative launch stays: DSV4_PORT=5700 DSV4_MAXLEN=524288
+  bash launch/run-pp-dspark.sh (model default is correct again; the old
+  /mnt/data model path in the 16:40 command no longer exists).

@@ -42,7 +42,7 @@ IMG="${DSV4_IMAGE:-dsv4-a100-fullbuild:devel}"
 # with no rebuild. If you applied the patches at build time instead, set
 # DSV4_NO_MOUNT=1 and the mounts are skipped.
 R="${DSV4_VLLM_SRC:-/mnt/nvme1/dsv4/vllm-c3046d1/vllm}"
-MODEL="${DSV4_MODEL:-/mnt/data/DeepSeek-V4-Flash-0731}"
+MODEL="${DSV4_MODEL:-/mnt/nvme1/dsv4/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
 MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
 # Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
@@ -95,6 +95,8 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/structured_output/backend_xgrammar.py \
            v1/structured_output/__init__.py \
            v1/core/sched/scheduler.py \
+           v1/core/sched/interface.py \
+           v1/engine/core.py \
            parser/engine/adapters.py \
            parser/abstract_parser.py \
            entrypoints/openai/chat_completion/serving.py \
@@ -119,6 +121,7 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
   -e DSV4_TYPEB_POLICY="${DSV4_TYPEB_POLICY:-commit}" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
+  -e VLLM_PP_LAYER_PARTITION=12,12,12,7 \
   -v $CACHE_DIR:/root/.cache \
   -v "$MODEL":/model \
   $MOUNTS \
@@ -126,7 +129,7 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   "$IMG" vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 --kv-cache-dtype fp8 --block-size 256 \
   --max-model-len "$MAXLEN" --max-num-batched-tokens 2048 --trust-remote-code \
-  --gpu-memory-utilization 0.85 --max-num-seqs 16 \
+  --gpu-memory-utilization 0.85 --max-num-seqs 32 \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --reasoning-parser deepseek_v4 \
