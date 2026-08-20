@@ -92,7 +92,7 @@ mid-args -> raw content leaks, finish=stop, 0022 pseudo_tag. Phase0 L on the
 
 | # | patch | files | purpose | env knobs |
 |---|-------|-------|---------|-----------|
-| 0025 | typeb-finish (F3b) | v1/core/scheduler.py, .../chat_completion/serving.py | DSV4_TYPEB_POLICY=finish: on TYPE-B keep only the FSM-accepted prefix and finish the request this iteration (TYPE-A semantics — desync-safe, no future spec window); client gets a clean retryable cut instead of a malformed-envelope tail. Default commit = exact 0014 behavior. serving.py: new `typeb_cut` flag (proper `<｜DSML｜tool_calls>` opener without closer) distinguished from `pseudo_tag` garbage | DSV4_TYPEB_POLICY={commit,finish} (default commit — deploy alone is a no-op until set to finish at launch) |
+| 0025 | typeb-finish (F3b) | v1/core/sched/scheduler.py, .../chat_completion/serving.py | DSV4_TYPEB_POLICY=finish: on TYPE-B keep only the FSM-accepted prefix and finish the request this iteration (TYPE-A semantics — desync-safe, no future spec window); client gets a clean retryable cut instead of a malformed-envelope tail. Default commit = exact 0014 behavior. serving.py: new `typeb_cut` flag (proper `<｜DSML｜tool_calls>` opener without closer) distinguished from `pseudo_tag` garbage | DSV4_TYPEB_POLICY={commit,finish} (default commit — deploy alone is a no-op until set to finish at launch) |
 
 Local validation: py_compile both; _dsv4_0022_flags unit battery 8/8
 (typeb_cut vs pseudo_tag vs budget_burn vs closed-envelope); patch -p1 on

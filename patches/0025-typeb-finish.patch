@@ -1,5 +1,5 @@
---- a/vllm/v1/core/scheduler.py
-+++ b/vllm/v1/core/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
 @@ -1925,7 +1925,8 @@
              status_before_stop = request.status
              num_output_tokens_before = len(request._output_token_ids)
