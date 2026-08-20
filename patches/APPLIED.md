@@ -103,3 +103,39 @@ Deploy: patch -p1 on 760T tree (baselines = live 201120d3… scheduler /
 ba11e046… serving), relaunch WITH `DSV4_TYPEB_POLICY=finish` in env
 (plus DSV4_PORT=5700 DSV4_MAXLEN=524288), then re-run phase0 L arm —
 expect NO_TOOL_STOP+pseudo_tag -> TYPEB_CUT (clean prefix) or TOOL_OK.
+
+Deploy + live validation (2026-08-20 16:40, IN PROGRESS): patched tree
+md5 == local validated md5s (c4b15fcb… / fac70e0d…); 0022 tripwire keeps
+firing; 0025 marked active via `DSV4_TYPEB_POLICY=finish` env at launch.
+
+**Full launch command (authoritative, single line):**
+```
+ssh 760T 'cd /mnt/nvme1/dsv4/deepseek-v4-cmp170hx && \
+  DSV4_VLLM_SRC=/mnt/nvme1/dsv4/vllm-c3046d1/vllm \
+  DSV4_MODEL=/mnt/data/DeepSeek-V4-Flash-0731 \
+  DSV4_PORT=5700 DSV4_MAXLEN=524288 \
+  DSV4_TYPEB_POLICY=finish \
+  bash launch/run-pp-dspark.sh'
+```
+Required env on 760T: VLLM_SRC + MODEL (script defaults are generic `/opt/...` and
+`/models/...`), PORT, MAXLEN, TYPEB_POLICY (default commit preserves 0014).
+Rollback = drop `DSV4_TYPEB_POLICY=finish` from the env block.
+
+**LESSON — never scp local launch script over server copy** (16:40 footgun):
+my local repo's `launch/run-pp-dspark.sh` was rebuilt from scratch earlier
+and silently dropped four mount entries (`dspark/speculator.py`,
+`structured_output/__init__.py`, `parser/engine/adapters.py`,
+`parser/abstract_parser.py`) plus the `--enable-auto-tool-choice /
+--tool-call-parser / --reasoning-parser / --default-chat-template-kwargs`
+serve-args. scp'ing it onto 760T at the 16:40 restart silently
+disarmed `auto` tool_choice (caller got 400 from `/v1/chat/completions`).
+Server's git HEAD (`vllm-c3046d1` fork's authoritative launch) was the
+true source of truth and has been re-synced into the local repo
+(commit 896839e, md5 1858f0ae…). Single authoritative script now lives
+in the repo and the server; future deploys: `scp FROM server` (or just
+trust HEAD + repo) — never the other direction.
+
+Post-deploy A/B validation runs automatically via `tmp/0025-relaunch-and-verify.sh`:
+poll /v1/models until 200, then smoke (nonstream tools call) + phase0
+L arm rerun → tmp/reports/phase0-0025.jsonl. Watchdog at
+`/tmp/watchdog_5700.sh` already extended with `env0022` + `tbfin` columns.
