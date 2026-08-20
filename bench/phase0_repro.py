@@ -279,9 +279,10 @@ def classify(d, no_param_tool=None):
                 okargs = False
             if not (tc["function"]["arguments"] or "").strip():
                 okargs = False
+        if no_param_tool and names == [no_param_tool]:
+            # valid {} (or empty) args for the sole no-param tool
+            return "OK_EMPTY_ARGS", "legal {} for no-param tool", meta
         if not okargs:
-            if no_param_tool and names == [no_param_tool]:
-                return "OK_EMPTY_ARGS", "legal {} for no-param tool", meta
             return "ARGS_BAD", "n=%d names=%s arglens=%s" % (len(tcs), names, arglens), meta
         cls = "TOOL_OK" if all(n in TOOL_NAMES for n in names) else "TOOL_WRONGNAME"
         if len(tcs) > 1 and len(set(names)) < len(names):

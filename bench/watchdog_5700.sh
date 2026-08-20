@@ -9,7 +9,7 @@ INTERVAL="${WATCHDOG_INTERVAL:-300}"
 LOG="${WATCHDOG_LOG:-/tmp/dsv4-watchdog.log}"
 LAST=0  # docker logs --since anchor, seconds
 
-echo "ts,http,reqs,612,typeA,typeB,salvage,tripwire,dead,tb" >> "$LOG"
+echo "ts,http,reqs,612,typeA,typeB,salvage,tripwire,dead,tb,env0022,tbfin" >> "$LOG"
 
 while true; do
     ts=$(date +%m-%d_%H:%M)
@@ -26,7 +26,9 @@ while true; do
     trip=$(grep -c 'soup-tripwire' "$tmp" || true)
     dead=$(grep -c 'EngineDeadError' "$tmp" || true)
     tb=$(grep -c 'Traceback' "$tmp" || true)
-    echo "$ts,$code,$reqs,$sig612,$typeA,$typeB,$salv,$trip,$dead,$tb" >> "$LOG"
+    env222=$(grep -c '0022 envelope-missing' "$tmp" || true)
+    tbfin=$(grep -c 'typeb-finish' "$tmp" || true)
+    echo "$ts,$code,$reqs,$sig612,$typeA,$typeB,$salv,$trip,$dead,$tb,$env222,$tbfin" >> "$LOG"
     # alert line when something nonzero-scary appears (log only)
     if [ "${dead:-0}" != "0" ] || [ "${tb:-0}" != "0" ] || [ "$code" != "200" ]; then
         echo "$ts ALERT http=$code dead=$dead tb=$tb" >> "$LOG"

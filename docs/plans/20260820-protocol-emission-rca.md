@@ -233,3 +233,36 @@ auto 请求从第 0 token 起即无约束；解析器对"信封缺失"按设计�
 2. 新栈（0022-0024，旋钮全 OFF）与旧栈行为一致 —— 无回归（E3 33 轮零信封失败）。
 3. 0022 线上已验证触发路径（budget_burn 探针 + 日志/响应字段双确认）；
    服务器 2h 窗口仅 1 次 0022 事件（即探针自身），E3 期间 0 误报。
+
+## 7. Phase 0 复现器最终数据（2026-08-20，bench/phase0_repro.py，0022-0024 栈）
+
+harness 形态对齐 cc-haha 真实客户端（代理省略 max_tokens、单 system、tool_result→role:tool、
+thinking→reasoning 映射）；L 臂内嵌 reasonix 事故 .vue 代码块 + CC Bash schema。
+
+**Arm L 长参数（Write .vue / Bash heredoc，n=2×5 档）**：
+| 档 | 结果 | 定性 |
+|----|------|------|
+| L-W2k / L-W8k（Write 事故块 2k/8k 字符） | 3× NO_TOOL_STOP + `dsv4_flags=["pseudo_tag"]` | **事故链复现**：TYPE-B→无约束尾→畸形信封（`<｜DSML｜tool_calls<invoke` 缺 ｜DSML｜）→salvage-cap 截断→原文泄漏；0022 正确标记 |
+| L-W32k（66k 字符参数 > max_tokens） | 2× FAIL_0023（截断 args + finish=tool_calls，两轮 arglen 66629/66654 不等） | 参数预算类失败：模型产出≠请求内容，客户端应分块写；非 0025 目标 |
+| L-B4k / L-B12k（Bash heredoc 事故形态） | 4× TOOL_OK | — |
+
+**Arm R 真实累积循环**（模拟 FS + 真实工具输出回放 + 14 步 checklist）：
+213k / 48 轮，**信封失败 0**（14 TOOL_OK 完成全部步骤；34 次 NO_TOOL_STOP 均为
+"checklist 已完成"的合法收尾叙述，flags=-、无伪标签）——真实工具输出 + 深度累积
+仍不足以触发；触发要素是 **单发超长参数（Write 大文件）**。
+
+**Arm X 边界矩阵**（10 边 × n=3）：30/30 全清（TOOL_OK 27 + OK_EMPTY_ARGS 3；
+32k 超大结果注入、DSML 汤投毒、伪标签历史、5 连失败、raw-DSML 历史、空参工具、
+并行调用、转义、混合叙述均无退化）。
+
+**根因闭环**（L 臂 + 单发探针 + 服务器日志三方一致）：
+spec 投机块含 FSM 拒绝 token 且 FSM 未终止（TYPE-B）→ 0013 提交整块并放弃约束 →
+0014 64-token salvage 预算内模型重发**畸形**信封 → salvage-cap FINISHED_STOPPED
+截在参数中段 → 解析失败 → finish=stop + 原文泄漏（0022 pseudo_tag）。
+0023 无法覆盖（畸形形态不开槽）。
+
+**修复 = 0025 typeb-finish**（F3b，patches/0025-typeb-finish.patch，已 staged）：
+`DSV4_TYPEB_POLICY=finish` 时 TYPE-B 只保留 FSM 已接受前缀并当轮完成请求
+（TYPE-A 同款 desync-safe 路径）；客户端得到"干净的可重试截断"
+（`dsv4_flags=["typeb_cut"]` 新标志）而非畸形尾。默认 commit = 0014 原行为。
+待部署 A/B：期望 L-W2k/W8k 的 NO_TOOL_STOP+pseudo_tag → TYPEB_CUT / TOOL_OK。
