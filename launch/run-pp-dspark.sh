@@ -90,7 +90,12 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            model_executor/layers/sparse_attn_indexer.py \
            parser/deepseek_v4.py \
            v1/structured_output/backend_xgrammar.py \
-           v1/core/sched/scheduler.py; do
+           v1/core/sched/scheduler.py \
+           entrypoints/openai/chat_completion/serving.py \
+           entrypoints/openai/chat_completion/protocol.py \
+           parser/engine/parser_engine.py \
+           tokenizers/deepseek_v4_encoding.py \
+           tokenizers/deepseek_v4.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."

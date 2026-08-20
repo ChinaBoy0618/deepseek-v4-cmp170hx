@@ -38,3 +38,33 @@ Validation state (2026-08-19 three-round battery): ctx 4.7K-498K 64/64 arms-pass
 Issue-replay state (2026-08-19 late, 0019v2 stack): verbatim issue-1/2 poison replay (i1 x4/i1t/i2, temp 1.0) zero errors, think_leak=0, soup cumulative fired correctly, rep-tripwire 9/20 induction + 0 false kills on 3/3 probes, hammer 200/200. One stochastic crash 11:42 (0010 OOV sentinel first-fire -> PP3 device assert): not reproduced in 60 poisoned requests, see README incident notes.
 
 0020 stack (2026-08-19 night, post verify-clamp): full replay zero errors zero crashes, rep-tripwire firing correctly, hammer 200/200, probes 3/3, spec acceptance length 3.2-4.2 (healthy), Out-of-vocab=0, EngineDead=0.
+
+0021 stack (2026-08-20): consecutive-tool replay B 2/2, E 3/3, A pass, hammer 200/200 (live validation, see commit 9396b68).
+
+## Staged — NOT yet applied on 760T container (2026-08-20)
+
+Implemented for the 20260820 tool-call degradation RCA (fix-plan F2/F3/F4/F5).
+Base verified byte-identical to live container (md5 of all 5 target files
+checked before patching). Stack order: 0022 -> 0023 -> 0024.
+
+| # | patch | files | purpose | env knobs |
+|---|-------|-------|---------|-----------|
+| 0022 | envelope tripwire (F2) | entrypoints/openai/chat_completion/serving.py, .../protocol.py | request has tools + response has 0 tool_calls -> log `DSV4 0022 envelope-missing` + response/chunk gains `dsv4_flags: ["pseudo_tag"|"budget_burn"]`; log-only, no generation change | DSV4_ENVELOPE_TRIPWIRE (default on, 0=off) |
+| 0023 | args-truncated finish (F3c) | parser/engine/parser_engine.py, .../serving.py | ToolCallSlot.closed; finish_streaming sets truncated_tool_args when a streamed slot never closed AND args are not valid JSON; streaming finish then reports finish_reason="length" instead of "tool_calls" so clients deterministically retry (kills silent truncated-JSON args from TYPE-B + 0014 64-token cap) | none (behavior: finish_reason semantics only) |
+| 0024 | template hardening (F4+F5) | tokenizers/deepseek_v4_encoding.py, tokenizers/deepseek_v4.py | F4: protocol CORRECT/INCORRECT examples in tools section; tool_result truncation + pseudo-tag backtick escape; consecutive-failure SYSTEM WARNING; history-think placeholder (keep only post-last-user reasoning). F5: auto-disable thinking on tool turns. ALL default OFF | DSV4_TPL_EXAMPLES=1, DSV4_TOOL_RESP_MAX=<chars> (0=off), DSV4_TPL_FAILWARN=<n>, DSV4_TPL_THINKING_KEEP=last, DSV4_AUTO_DISABLE_THINKING_TOOLS=1; per-request: chat_template_kwargs {"auto_disable_thinking_with_tools": bool} |
+
+Local validation (2026-08-20): ast.parse all 5 files; encode_messages
+functional battery PASS (default-off no-op vs live base behavior identical;
+each knob exercised; 0021 raw-DSML lift regression PASS; stack applies
+cleanly via patch -p1 in order and reproduces target md5s).
+
+Deploy: add 5 files to launch/run-pp-dspark.sh MOUNTS (done in repo),
+sync patched checkout to 760T, relaunch. NOT deployed — awaiting user go.
+
+Watchdogs: add "DSV4 0022 envelope-missing" count + finish=length rate to
+watchdog_5700 CSV after deploy.
+
+Note (resolved 2026-08-20): 0017v2-0021 were synced back to the repo via
+pull (commits ec71531..9396b68); the "live ahead of repo" drift is closed.
+0022+ layer cleanly on top of the 0021 stack (base md5s re-verified against
+the live container before patching).

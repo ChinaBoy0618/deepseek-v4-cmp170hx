@@ -1,0 +1,170 @@
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -3,6 +3,7 @@
+ 
+ import asyncio
+ import io
++import os
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
+@@ -66,6 +67,29 @@
+ from vllm.utils.collection_utils import as_list
+ 
+ logger = init_logger(__name__)
++
++
++# ============================================================
++# DSV4 0022: envelope-presence tripwire (log-only measurement)
++# ============================================================
++# When a request carries tools but the response emits zero tool calls,
++# classify the text so pseudo-tag / budget-burn rates become visible.
++# Disable with env DSV4_ENVELOPE_TRIPWIRE=0.
++_DSV4_0022_ENABLED = os.environ.get("DSV4_ENVELOPE_TRIPWIRE", "1") != "0"
++_DSV4_0022_SIGS = (
++    "<bash", "<Bash ", "<bash_command>", "<call ",
++    "<thinking>", "｜DSML｜_tool_calls", "<｜DSML｜",
++    "_tool_calls>",
++)
++
++
++def _dsv4_0022_flags(text: str, finish_reason: str | None) -> list[str] | None:
++    """Classify a tools-request response body that emitted no tool call."""
++    if any(s in text for s in _DSV4_0022_SIGS):
++        return ["pseudo_tag"]
++    if finish_reason == "length":
++        return ["budget_burn"]
++    return None
+ 
+ 
+ def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
+@@ -658,6 +682,8 @@
+                     include_token_ids = (
+                         request.return_token_ids and not hide_stream_metadata
+                     )
++
++                    _flags_0022 = None  # DSV4 0022
+ 
+                     if output.finish_reason is None:
+                         # Send token-by-token response for each request.n
+@@ -688,6 +714,27 @@
+                             finish_reason_ = (
+                                 output.finish_reason if output.finish_reason else "stop"
+                             )
++
++                        # DSV4 0022: envelope-presence tripwire (log-only).
++                        if (
++                            _DSV4_0022_ENABLED
++                            and request.tools
++                            and not tools_streamed[i]
++                        ):
++                            _flags_0022 = _dsv4_0022_flags(
++                                previous_texts[i], finish_reason_
++                            )
++                            if _flags_0022:
++                                logger.warning(
++                                    "DSV4 0022 envelope-missing request_id=%s "
++                                    "flags=%s finish=%s",
++                                    request_id,
++                                    _flags_0022,
++                                    finish_reason_,
++                                )
++                        else:
++                            _flags_0022 = None
++
+                         choice_data = ChatCompletionResponseStreamChoice(
+                             index=i,
+                             delta=delta_message,
+@@ -709,6 +756,8 @@
+                         choices=[choice_data],
+                         model=model_name,
+                     )
++                    if _flags_0022:  # DSV4 0022
++                        chunk.dsv4_flags = _flags_0022
+                     # Stamp the fingerprint on terminal chunks only (those with
+                     # finish_reason set). When ``include_usage`` is on, the
+                     # trailing usage chunk below overrides this as the true
+@@ -847,6 +896,7 @@
+         tool_parser_cls = (
+             self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
+         )
++        dsv4_0022_flags: list[str] = []  # DSV4 0022
+         for output in final_res.outputs:
+             # check for error finish reason and raise GenerationError
+             # finish_reason='error' indicates a retryable request-level internal error
+@@ -986,6 +1036,28 @@
+                 routed_experts=routed_experts_b64,
+             )
+             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
++
++            # DSV4 0022: envelope-presence tripwire (log-only).
++            if (
++                _DSV4_0022_ENABLED
++                and request.tools
++                and not is_named_tool_choice
++                and not is_required_tool_choice
++                and not auto_tools_called
++                and tool_parser_cls is not None
++            ):
++                _flags_0022 = _dsv4_0022_flags(
++                    content or "", output.finish_reason
++                )
++                if _flags_0022:
++                    dsv4_0022_flags.extend(_flags_0022)
++                    logger.warning(
++                        "DSV4 0022 envelope-missing request_id=%s flags=%s "
++                        "finish=%s",
++                        request_id,
++                        _flags_0022,
++                        output.finish_reason,
++                    )
+ 
+             choices.append(choice_data)
+ 
+@@ -1047,6 +1119,7 @@
+             choices=choices,
+             usage=usage,
+             system_fingerprint=self.system_fingerprint,
++            dsv4_flags=dsv4_0022_flags or None,  # DSV4 0022
+             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
+             prompt_token_ids=(
+                 final_res.prompt_token_ids if request.return_token_ids else None
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -135,8 +135,19 @@
+         default=None, description="ECTransfer parameters."
+     )
+     metrics: PerRequestTimingMetrics | None = None
++    # DSV4 0022: set when a tools request emitted no tool call and the
++    # text carries degradation signatures ("pseudo_tag") or burned the
++    # budget ("budget_burn"). Measurement only; never changes generation.
++    dsv4_flags: list[str] | None = None
+ 
++    @model_serializer(mode="wrap")
++    def _serialize_dsv4(self, handler):
++        data = handler(self)
++        if data.get("dsv4_flags") is None:
++            data.pop("dsv4_flags", None)
++        return data
+ 
++
+ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+     index: int
+     delta: DeltaMessage
+@@ -163,6 +174,16 @@
+     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
+     prompt_text: str | None = None
+     metrics: PerRequestTimingMetrics | None = None
++    # DSV4 0022: same semantics as ChatCompletionResponse.dsv4_flags;
++    # set on the terminal chunk of a degraded tools request.
++    dsv4_flags: list[str] | None = None
++
++    @model_serializer(mode="wrap")
++    def _serialize_dsv4(self, handler):
++        data = handler(self)
++        if data.get("dsv4_flags") is None:
++            data.pop("dsv4_flags", None)
++        return data
+ 
+ 
+ class ChatCompletionToolsParam(OpenAIBaseModel):
