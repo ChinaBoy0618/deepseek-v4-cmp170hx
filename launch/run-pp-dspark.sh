@@ -41,8 +41,8 @@ IMG="${DSV4_IMAGE:-dsv4-a100-fullbuild:devel}"
 # vLLM with `pip install -e .`, so bind-mounting these five files applies the patches
 # with no rebuild. If you applied the patches at build time instead, set
 # DSV4_NO_MOUNT=1 and the mounts are skipped.
-R="${DSV4_VLLM_SRC:-/opt/vllm-dsv4/vllm}"
-MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
+R="${DSV4_VLLM_SRC:-/mnt/nvme1/dsv4/vllm-c3046d1/vllm}"
+MODEL="${DSV4_MODEL:-/mnt/data/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
 MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
 # Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
