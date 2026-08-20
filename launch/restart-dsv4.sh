@@ -36,7 +36,7 @@ fi
 echo "[restart-dsv4] launching (load strategy: ${LOAD_STRATEGY}), log: $LOG"
 nohup bash run-pp-dspark.sh --maxlen 524288 > "$LOG" 2>&1 &
 
-MISSES=0  # consecutive docker-ps misses (3 = 30s grace for docker-run registration)
+MISSES=0  # consecutive docker-ps misses AFTER the real docker run was issued
 for i in $(seq 1 360); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
          http://localhost:5700/health 2>/dev/null || true)
@@ -45,14 +45,20 @@ for i in $(seq 1 360); do
     exit 0
   fi
   if ! docker ps --format '{{.Names}}' | grep -q '^dsv4-a100$'; then
-    MISSES=$((MISSES + 1))
-    if [ "$MISSES" -lt 3 ]; then
-      sleep 10
-      continue
+    # run-pp-dspark.sh prelude runs a ~40s GPU wedge probe as an anonymous
+    # docker-run --rm container BEFORE the real `docker run -d` — during that
+    # window dsv4-a100 is legitimately absent from docker ps. Only trust a
+    # death verdict once the launch log shows the real run was issued.
+    if grep -q '^launched dsv4-a100' "$LOG" 2>/dev/null; then
+      MISSES=$((MISSES + 1))
+      if [ "$MISSES" -ge 3 ]; then
+        echo "[restart-dsv4] container died during startup; tail of $LOG:"
+        tail -20 "$LOG"
+        exit 1
+      fi
     fi
-    echo "[restart-dsv4] container died during startup; tail of $LOG:"
-    tail -20 "$LOG"
-    exit 1
+    sleep 10
+    continue
   fi
   MISSES=0
   sleep 10
