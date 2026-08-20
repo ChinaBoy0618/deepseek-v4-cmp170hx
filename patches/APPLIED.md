@@ -39,6 +39,12 @@ Issue-replay state (2026-08-19 late, 0019v2 stack): verbatim issue-1/2 poison re
 
 0020 stack (2026-08-19 night, post verify-clamp): full replay zero errors zero crashes, rep-tripwire firing correctly, hammer 200/200, probes 3/3, spec acceptance length 3.2-4.2 (healthy), Out-of-vocab=0, EngineDead=0.
 
+0021 stack (2026-08-19 23:10 -> 2026-08-20 18:23, ~20h prod soak incl. real Claude Code traffic): watchdog clean, no crash; suites below re-run after 0026 deploy all PASS.
+
+0026 stack (2026-08-20 19:03, NaN argmax guard — allover326 PR #10 / vllm#50183, direct apply, zero port): launched on 5700 with 19-file mounts. Canary same evening: tdd_0026 live repro (stock emits OOB padded-region id 999999 on all-NaN row; patched emits deterministic in-range 1000; clean rows byte-identical), tdd_consecutive_tools PASS (B 3/3, C 3/3), tdd_consecutive_stream PASS (D 3/3+3/3, E 3/3), tdd_issue_replay zero leaks/tripwires/dead, hammer 200/200 ALL GOOD. Root-cause fix for issue #9-class repetition ("复读机"): complements 0015-0019 tripwires (those stop damage after; this prevents the bad token from ever committing). NOTE: the 19:03 launch carries the 0022-0025 tree but WITHOUT DSV4_TYPEB_POLICY=finish (0025 dormant in default commit mode — the pending finish-mode A/B is still unexecuted; restart-dsv4.sh passes DSV4_TYPEB_POLICY through for when it is). Numbering: 0022 = envelope-tripwire (parallel session); NaN guard = 0026.
+
+2026-08-20 infra notes: machine RAM upgraded 31G->125G (reboot, /tmp wiped — watchdog re-deployed from bench/); launch/run-pp-dspark.sh had lost the 0020 mount + MODEL default had reverted to /models (an earlier edit) — both restored, 0026 mount added (19 files now); launch/restart-dsv4.sh added (one-command recovery, defaults --safetensors-load-strategy prefetch for the 125G-RAM cold-boot path); Windows-side availability alert (vllm-maker poll_5700_alert.py + Startup VBS).
+
 0021 stack (2026-08-20): consecutive-tool replay B 2/2, E 3/3, A pass, hammer 200/200 (live validation, see commit 9396b68).
 
 ## Applied on 760T container 2026-08-20 13:2x (deployed + validated)
