@@ -109,13 +109,14 @@ fi
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
+  -e DSV4_TYPEB_POLICY="${DSV4_TYPEB_POLICY:-commit}" \
   -v "$MODEL":/model \
   $MOUNTS \
-  --shm-size=16g -p 8098:8000 \
+  --shm-size=16g -p ${DSV4_PORT:-8098}:8000 \
   "$IMG" vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 --kv-cache-dtype fp8 --block-size 256 \
   --max-model-len "$MAXLEN" --max-num-batched-tokens 2048 --trust-remote-code \
   --gpu-memory-utilization 0.85 --max-num-seqs 8 \
   --no-enable-flashinfer-autotune --tokenizer-mode deepseek_v4 \
   $SPEC >/dev/null
-echo "launched dsv4-a100 on :8098  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"
+echo "launched dsv4-a100 on :${DSV4_PORT:-8098}  (maxlen $MAXLEN, row_chunk $ROW_CHUNK, spec: ${SPEC:-none})"
