@@ -89,19 +89,15 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/worker/gpu/spec_decode/dspark/utils.py \
            v1/worker/gpu/spec_decode/dspark/speculator.py \
            v1/worker/gpu/spec_decode/rejection_sampler.py \
-           v1/worker/gpu/spec_decode/rejection_sampler_utils.py \
            model_executor/layers/sparse_attn_indexer.py \
            parser/deepseek_v4.py \
+           tokenizers/deepseek_v4_encoding.py \
            v1/structured_output/backend_xgrammar.py \
            v1/structured_output/__init__.py \
            v1/core/sched/scheduler.py \
            parser/engine/adapters.py \
            parser/abstract_parser.py \
-           entrypoints/openai/chat_completion/serving.py \
-           entrypoints/openai/chat_completion/protocol.py \
-           parser/engine/parser_engine.py \
-           tokenizers/deepseek_v4_encoding.py \
-           tokenizers/deepseek_v4.py; do
+           entrypoints/openai/chat_completion/protocol.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."
@@ -117,7 +113,6 @@ mkdir -p $CACHE_DIR
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
-  -e DSV4_TYPEB_POLICY="${DSV4_TYPEB_POLICY:-commit}" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -v $CACHE_DIR:/root/.cache \
   -v "$MODEL":/model \

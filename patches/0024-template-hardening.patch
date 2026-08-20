@@ -1,0 +1,210 @@
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -91,6 +91,7 @@
+ 
+ Otherwise, output directly after {thinking_end_token} with tool calls or final response.
+ 
++{tool_examples}
+ ### Available Tool Schemas
+ 
+ {tool_schemas}
+@@ -99,6 +100,59 @@
+ """
+ 
+ # ============================================================
++# DSV4 0024 (F4): template hardening knobs (all default OFF)
++# ============================================================
++import os as _os_0024
++import re as _re_0024
++
++# Protocol CORRECT/INCORRECT examples in the system tools section.
++_DSV4_0024_EXAMPLES = _os_0024.environ.get("DSV4_TPL_EXAMPLES", "0") == "1"
++# Max chars per historical tool_result (0 = no truncation).
++_DSV4_0024_TOOL_RESP_MAX = int(_os_0024.environ.get("DSV4_TOOL_RESP_MAX", "0"))
++# Inject a SYSTEM WARNING after N consecutive failed tool results (0 = off).
++_DSV4_0024_FAILWARN_N = int(_os_0024.environ.get("DSV4_TPL_FAILWARN", "0"))
++# Keep only post-last-user reasoning; earlier think blocks become a placeholder.
++_DSV4_0024_KEEP_LAST_THINKING = (
++    _os_0024.environ.get("DSV4_TPL_THINKING_KEEP", "") == "last"
++)
++
++TOOLS_EXAMPLES_TEMPLATE = """### Protocol Correctness Examples
++
++CORRECT - complete parameters, all required parameters present:
++<{dsml_token}tool_calls>
++<{dsml_token}invoke name="Bash">
++<{dsml_token}parameter name="command" string="true">uptime</{dsml_token}parameter>
++</{dsml_token}invoke>
++</{dsml_token}tool_calls>
++
++CORRECT - multiple invokes in one block, non-string JSON value with string="false":
++<{dsml_token}tool_calls>
++<{dsml_token}invoke name="Write">
++<{dsml_token}parameter name="path" string="true">/tmp/a.txt</{dsml_token}parameter>
++<{dsml_token}parameter name="content" string="true">hello</{dsml_token}parameter>
++</{dsml_token}invoke>
++<{dsml_token}invoke name="Read">
++<{dsml_token}parameter name="path" string="true">/tmp/a.txt</{dsml_token}parameter>
++<{dsml_token}parameter name="offset" string="false">10</{dsml_token}parameter>
++</{dsml_token}invoke>
++</{dsml_token}tool_calls>
++
++INCORRECT - empty invoke or missing a required parameter:
++<{dsml_token}tool_calls>
++<{dsml_token}invoke name="Bash"></{dsml_token}invoke>
++</{dsml_token}tool_calls>
++
++INCORRECT - parameter left unclosed or value truncated mid-stream:
++<{dsml_token}tool_calls>
++<{dsml_token}invoke name="Write">
++<{dsml_token}parameter name="content" string="true">a very long value that was cut off mid
++</{dsml_token}tool_calls>
++
++Tool calls must be emitted ONLY inside a complete <{dsml_token}tool_calls> block with
++every <{dsml_token}parameter> closed. Never use any other syntax: no XML tags such as
++<bash>, no prose narration, no JSON code blocks."""
++
++# ============================================================
+ # Utility Functions
+ # ============================================================
+ 
+@@ -168,8 +222,13 @@
+     """
+     tools_json = [to_json(t) for t in tools]
+ 
++    tool_examples = ""
++    if _DSV4_0024_EXAMPLES:
++        tool_examples = TOOLS_EXAMPLES_TEMPLATE.format(dsml_token=dsml_token)
++
+     return TOOLS_TEMPLATE.format(
+         tool_schemas="\n".join(tools_json),
++        tool_examples=tool_examples,
+         dsml_token=dsml_token,
+         thinking_start_token=thinking_start_token,
+         thinking_end_token=thinking_end_token,
+@@ -313,6 +372,16 @@
+ 
+         if thinking_mode == "thinking" and not prev_has_task:
+             if not drop_thinking or index > last_user_idx:
++                # DSV4 0024 (F4): when tool-bearing history keeps every
++                # think block, collapse pre-last-user reasoning to a
++                # placeholder to cut the accumulated thinking tax.
++                if (
++                    _DSV4_0024_KEEP_LAST_THINKING
++                    and not drop_thinking
++                    and index < last_user_idx
++                    and reasoning
++                ):
++                    reasoning = "(previous reasoning elided)"
+                 thinking_part = thinking_template.format(reasoning=reasoning) + thinking_end_token
+             else:
+                 thinking_part = ""
+@@ -432,8 +501,40 @@
+                 msg["tool_calls"] = calls
+         out.append(msg)
+     return out
++
++
++# ------------------------------------------------------------
++# DSV4 0024 (F4): tool_result sanitizers + failure warning
++# ------------------------------------------------------------
++_DSV4_0024_PSEUDO_RE = _re_0024.compile(r"<(/?)(bash|Bash|bash_command|call)([ >])")
++_DSV4_0024_EXIT_RE = _re_0024.compile(r'"exit(?:_code)?"\s*:\s*([1-9]\d*)')
++
++
++def _dsv4_0024_sanitize_tool_content(content):
++    """Truncate very long tool results and backtick-escape pseudo-tag
++    signatures (e.g. ``<bash>``) so history stops being an imitation
++    source for envelope degradation."""
++    if not isinstance(content, str) or not content:
++        return content
++    if _DSV4_0024_TOOL_RESP_MAX > 0 and len(content) > _DSV4_0024_TOOL_RESP_MAX:
++        content = (
++            content[: _DSV4_0024_TOOL_RESP_MAX]
++            + "\n...[truncated %d chars]" % (len(content) - _DSV4_0024_TOOL_RESP_MAX)
++        )
++    return _DSV4_0024_PSEUDO_RE.sub(r"`<\1\2\3", content)
+ 
+ 
++def _dsv4_0024_is_error_result(content) -> bool:
++    if not isinstance(content, str) or not content.strip():
++        return False
++    head = content[:300]
++    if head.lstrip()[:5].lower() == "error":
++        return True
++    if '"error"' in head.lower():
++        return True
++    return bool(_DSV4_0024_EXIT_RE.search(head))
++
++
+ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     """
+     Merge tool messages into the preceding user message using content_blocks format.
+@@ -452,17 +553,31 @@
+         Processed message list with tool messages merged into user messages.
+     """
+     merged: List[Dict[str, Any]] = []
++    consecutive_failures = 0
+ 
+     for msg in messages:
+         msg = copy.deepcopy(msg)
+         role = msg.get("role")
+ 
+         if role == "tool":
++            tool_content = _dsv4_0024_sanitize_tool_content(msg.get("content", ""))
++            if _DSV4_0024_FAILWARN_N > 0:
++                if _dsv4_0024_is_error_result(msg.get("content", "")):
++                    consecutive_failures += 1
++                    if consecutive_failures >= _DSV4_0024_FAILWARN_N:
++                        tool_content = (
++                            "[SYSTEM WARNING] The last %d tool calls failed "
++                            "consecutively. Re-examine the failure before your "
++                            "next call; do not repeat the same failing call."
++                            "\n\n" % consecutive_failures
++                        ) + tool_content
++                else:
++                    consecutive_failures = 0
+             # Convert tool message to a user message with tool_result block
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": tool_content,
+             }
+             # Merge into previous message if it's already a user (merged tool)
+             if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
+--- a/vllm/tokenizers/deepseek_v4.py
++++ b/vllm/tokenizers/deepseek_v4.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import copy
++import os
+ from typing import Any
+ 
+ from transformers import TokenizersBackend
+@@ -32,6 +33,24 @@
+             thinking = kwargs.get("thinking", False)
+             enable_thinking = kwargs.get("enable_thinking", False)
+             thinking = thinking or enable_thinking
++
++            # DSV4 0024 (F5): gray-release knob — disable thinking on
++            # tool-bearing turns to cut the pre-envelope thinking tax in
++            # agent loops. Default off. Per-request opt-in/out via
++            # chat_template_kwargs {"auto_disable_thinking_with_tools":
++            # bool}; env DSV4_AUTO_DISABLE_THINKING_TOOLS=1 sets the
++            # server default. NOTE: with the knob on, tool turns are
++            # forced to chat mode even if the server default injected
++            # thinking=true; set the kwarg to false per request to opt
++            # out of the knob itself.
++            _adt = kwargs.get("auto_disable_thinking_with_tools")
++            if _adt is None:
++                _adt = os.environ.get(
++                    "DSV4_AUTO_DISABLE_THINKING_TOOLS", "0"
++                ) == "1"
++            if tools and _adt:
++                thinking = False
++
+             thinking_mode = "thinking" if thinking else "chat"
+ 
+             conversation = kwargs.get("conversation", messages)

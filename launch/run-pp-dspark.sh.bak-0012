@@ -36,13 +36,13 @@
 # (dspark_target_layer_ids = [40,41,42] of 43 layers) AND lm_head both land on the
 # last PP rank, which is where the model runner already builds the drafter.
 # ---- configure these three for your machine -----------------------------------
-IMG="${DSV4_IMAGE:-dsv4-a100-fullbuild:devel}"
+IMG="${DSV4_IMAGE:-dsv4-a100:devel}"
 # VLLM_SRC: the vllm/ package directory of your PATCHED checkout. The image installs
 # vLLM with `pip install -e .`, so bind-mounting these five files applies the patches
 # with no rebuild. If you applied the patches at build time instead, set
 # DSV4_NO_MOUNT=1 and the mounts are skipped.
 R="${DSV4_VLLM_SRC:-/mnt/nvme1/dsv4/vllm-c3046d1/vllm}"
-MODEL="${DSV4_MODEL:-/mnt/data/DeepSeek-V4-Flash-0731}"
+MODEL="${DSV4_MODEL:-/models/DeepSeek-V4-Flash-0731}"
 # -------------------------------------------------------------------------------
 MAXLEN="${DSV4_MAXLEN:-32768}"    # with ROW_CHUNK set, 393216 and 1048576 both work
 # Patch 0006 is ENV-GATED AND DEFAULTS TO OFF (0). Without this the context-ceiling fix is
@@ -87,9 +87,6 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/worker/gpu/pp_utils.py \
            v1/worker/gpu/model_runner.py \
            v1/worker/gpu/spec_decode/dspark/utils.py \
-           v1/worker/gpu/spec_decode/dspark/speculator.py \
-           v1/worker/gpu/spec_decode/rejection_sampler.py \
-           v1/worker/gpu/spec_decode/rejection_sampler_utils.py \
            model_executor/layers/sparse_attn_indexer.py \
            parser/deepseek_v4.py \
            v1/structured_output/backend_xgrammar.py \
@@ -97,11 +94,7 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/core/sched/scheduler.py \
            parser/engine/adapters.py \
            parser/abstract_parser.py \
-           entrypoints/openai/chat_completion/serving.py \
-           entrypoints/openai/chat_completion/protocol.py \
-           parser/engine/parser_engine.py \
-           tokenizers/deepseek_v4_encoding.py \
-           tokenizers/deepseek_v4.py; do
+           entrypoints/openai/chat_completion/protocol.py; do
     if [ ! -f "$R/$f" ]; then
       echo "ERROR: $R/$f not found. Set DSV4_VLLM_SRC to the vllm/ directory of your"
       echo "patched checkout, or set DSV4_NO_MOUNT=1 if the patches are baked into \$IMG."
@@ -117,7 +110,6 @@ mkdir -p $CACHE_DIR
 docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
-  -e DSV4_TYPEB_POLICY="${DSV4_TYPEB_POLICY:-commit}" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -v $CACHE_DIR:/root/.cache \
   -v "$MODEL":/model \

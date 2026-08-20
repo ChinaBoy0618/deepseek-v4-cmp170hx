@@ -1,0 +1,94 @@
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -703,13 +703,24 @@
+                         # finish_reason='error' indicates a retryable error
+                         self._raise_if_error(output.finish_reason, request_id)
+ 
++                        # DSV4 0023: the parser engine force-finished a tool
++                        # call mid-argument (TYPE-B + 0014 salvage budget).
++                        # Report "length" instead of "tool_calls" so clients
++                        # deterministically retry instead of executing a
++                        # silently truncated JSON payload.
++                        _trunc_0023 = getattr(
++                            parser, "truncated_tool_args", False
++                        )
++
+                         # Send the finish response for each request.n only once
+                         # In OpenAI's API, when a tool is called, the
+                         # finish_reason is:
+                         # "tool_calls" for "auto" or "required" tool calls,
+                         # and "stop" for named tool calls.
+                         if tools_streamed[i] and not tool_choice_function_name:
+-                            finish_reason_ = "tool_calls"
++                            finish_reason_ = (
++                                "length" if _trunc_0023 else "tool_calls"
++                            )
+                         else:
+                             finish_reason_ = (
+                                 output.finish_reason if output.finish_reason else "stop"
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -52,6 +52,7 @@
+         "_args_parts",
+         "_args_joined",
+         "name_sent",
++        "closed",  # DSV4 0023
+         "string_keys",
+         "streamed_json",
+     )
+@@ -62,6 +63,7 @@
+         self._args_parts: list[str] = []
+         self._args_joined: str | None = ""
+         self.name_sent: bool = False
++        self.closed: bool = False  # DSV4 0023
+         self.string_keys: set[str] | None = None
+         self.streamed_json: str = ""
+ 
+@@ -119,6 +121,7 @@
+         self._prompt_streaming_prepared: bool = False
+ 
+         self._tool_slots: list[ToolCallSlot] = []
++        self.truncated_tool_args: bool = False  # DSV4 0023
+         self._deferred_content: str = ""
+         self._deferred_reasoning: str = ""
+         self._content_has_nonws: bool = False
+@@ -188,14 +191,29 @@
+ 
+     def finish_streaming(self) -> DeltaMessage | None:
+         events = self._engine.finish()
++        delta = None
+         if events or self._deferred_content:
+-            return self._events_to_delta(events, finished=True)
+-        return None
++            delta = self._events_to_delta(events, finished=True)
++        # DSV4 0023: a slot that streamed arguments but never received its
++        # closing tool_end (and whose args are not complete JSON) was
++        # force-finished mid-argument (e.g. TYPE-B + 0014 salvage budget).
++        # Surface it so the serving layer can report finish_reason="length".
++        self.truncated_tool_args = False
++        for slot in self._tool_slots:
++            if slot.closed or not (slot.name_sent and slot.args.strip()):
++                continue
++            try:
++                json.loads(slot.args or "{}")
++            except Exception:
++                self.truncated_tool_args = True
++                break
++        return delta
+ 
+     def _reset(self, initial_state: ParserState | None = None) -> None:
+         self._engine.reset(initial_state=initial_state)
+         self._reasoning_ended = not self._has_reasoning
+         self._tool_slots.clear()
++        self.truncated_tool_args = False  # DSV4 0023
+         self._deferred_content = ""
+         self._deferred_reasoning = ""
+         self._content_has_nonws = False
+@@ -867,6 +885,7 @@
+ 
+         remaining = self._flush_arg_converter(idx)
+         slot = self._tool_slots[idx]
++        slot.closed = True  # DSV4 0023
+ 
+         if not slot.name_sent:
+             name = slot.name or self._try_extract_name(idx) or ""

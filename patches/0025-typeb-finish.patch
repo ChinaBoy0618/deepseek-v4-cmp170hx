@@ -1,0 +1,189 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1925,7 +1925,8 @@
+             status_before_stop = request.status
+             num_output_tokens_before = len(request._output_token_ids)
+             # DSV4 0013: set when the grammar completes inside this block
+-            # (TYPE-A); drives the explicit finish after the commit below.
++            # (TYPE-A), or when DSV4 0025 policy=finish cuts a live-FSM
++            # TYPE-B block; drives the explicit finish after the commit.
+             grammar_completed = False
+ 
+             if (
+@@ -1978,55 +1979,93 @@
+                             request.resumable = False
+                             stopped = True
+                     else:
+-                        logger.warning(
+-                            "Grammar rejected %s of %s speculative tokens "
+-                            "for request %s (TYPE-B: FSM still live); "
+-                            "abandoning structured-output enforcement and "
+-                            "committing the block unchanged.",
+-                            num_grammar_rejected,
+-                            len(new_token_ids),
+-                            req_id,
+-                        )
+-                        # read-only property: the next line flips use_structured_output
+-                        request.structured_output_request = None
+-                        # DSV4 0014: bound the unconstrained tail this
+-                        # just opened. Salvage fires at most once per
+-                        # request (the property flip above gates the
+-                        # FSM check), so the guard is armed exactly
+-                        # here:
+-                        #   A) a token budget so the tail cannot run
+-                        #      to max_tokens (DSV4_SALVAGE_TOKEN_BUDGET,
+-                        #      default 64; negative disables);
+-                        #   C') a degenerate-signature watch that
+-                        #      finishes the request the moment the
+-                        #      model starts emitting hallucinated
+-                        #      control tags (DSV4_SALVAGE_GUARD=0
+-                        #      disables).
+-                        # Fields attach dynamically (Request has no
+-                        # __slots__); _update_request_with_output reads
+-                        # them via getattr defaults.
+-                        try:
+-                            _budget = int(
+-                                os.environ.get(
+-                                    "DSV4_SALVAGE_TOKEN_BUDGET", "64"
++                        # DSV4 0025 (F3b): TYPE-B policy knob. The
++                        # unconstrained tail opened by the legacy "commit"
++                        # path re-emits malformed DSML envelopes in live
++                        # agent sessions (2026-08-20 reasonix: 3x in 15
++                        # min, salvage-cap then cut mid-args and the raw
++                        # content leaked to the client). DSV4_TYPEB_POLICY
++                        # == "finish" keeps only the FSM-accepted prefix
++                        # and finishes the request this iteration --
++                        # TYPE-A semantics, so the cut is desync-safe (no
++                        # future spec window consumes the misaligned
++                        # block) and the client sees a deterministic
++                        # cut-to-length-style signal it can retry on,
++                        # instead of garbage. Default "commit" preserves
++                        # the 0014 behavior exactly.
++                        if (
++                            os.environ.get("DSV4_TYPEB_POLICY", "commit")
++                            == "finish"
++                        ):
++                            logger.warning(
++                                "Grammar rejected %s of %s speculative "
++                                "tokens for request %s (TYPE-B: FSM still "
++                                "live); DSV4 0025 typeb-finish: keeping %s "
++                                "valid tokens and finishing the request.",
++                                num_grammar_rejected,
++                                len(new_token_ids),
++                                req_id,
++                                len(_kept),
++                            )
++                            new_token_ids = _kept
++                            grammar_completed = True
++                            if not new_token_ids:
++                                # The FSM rejected the very first token of
++                                # the block: nothing valid to commit; finish
++                                # here directly.
++                                request.status = RequestStatus.FINISHED_STOPPED
++                                request.resumable = False
++                                stopped = True
++                        else:
++                            logger.warning(
++                                "Grammar rejected %s of %s speculative tokens "
++                                "for request %s (TYPE-B: FSM still live); "
++                                "abandoning structured-output enforcement and "
++                                "committing the block unchanged.",
++                                num_grammar_rejected,
++                                len(new_token_ids),
++                                req_id,
++                            )
++                            # read-only property: the next line flips use_structured_output
++                            request.structured_output_request = None
++                            # DSV4 0014: bound the unconstrained tail this
++                            # just opened. Salvage fires at most once per
++                            # request (the property flip above gates the
++                            # FSM check), so the guard is armed exactly
++                            # here:
++                            #   A) a token budget so the tail cannot run
++                            #      to max_tokens (DSV4_SALVAGE_TOKEN_BUDGET,
++                            #      default 64; negative disables);
++                            #   C') a degenerate-signature watch that
++                            #      finishes the request the moment the
++                            #      model starts emitting hallucinated
++                            #      control tags (DSV4_SALVAGE_GUARD=0
++                            #      disables).
++                            # Fields attach dynamically (Request has no
++                            # __slots__); _update_request_with_output reads
++                            # them via getattr defaults.
++                            try:
++                                _budget = int(
++                                    os.environ.get(
++                                        "DSV4_SALVAGE_TOKEN_BUDGET", "64"
++                                    )
+                                 )
++                            except ValueError:
++                                _budget = 64
++                            request._dsv4_post_salvage_budget = (
++                                _budget if _budget >= 0 else None
+                             )
+-                        except ValueError:
+-                            _budget = 64
+-                        request._dsv4_post_salvage_budget = (
+-                            _budget if _budget >= 0 else None
+-                        )
+-                        request._dsv4_sig_watch = (
+-                            os.environ.get("DSV4_SALVAGE_GUARD", "1") != "0"
+-                            and self._dsv4_sig_cutback > 0
+-                        )
+-                        logger.info(
+-                            "DSV4 0014 salvage-guard armed for request %s "
+-                            "(budget=%s, sig_watch=%s)",
+-                            req_id,
+-                            _budget,
+-                            request._dsv4_sig_watch,
+-                        )
++                            request._dsv4_sig_watch = (
++                                os.environ.get("DSV4_SALVAGE_GUARD", "1") != "0"
++                                and self._dsv4_sig_cutback > 0
++                            )
++                            logger.info(
++                                "DSV4 0014 salvage-guard armed for request %s "
++                                "(budget=%s, sig_watch=%s)",
++                                req_id,
++                                _budget,
++                                request._dsv4_sig_watch,
++                            )
+ 
+             if observed_spec_decode:
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -2043,11 +2082,12 @@
+                     request, new_token_ids, is_stale=output_is_stale
+                 )
+                 if grammar_completed and not stopped:
+-                    # DSV4 0013 TYPE-A finish: the grammar completed at the
+-                    # end of the committed prefix. Stock v1 only stops
+-                    # masking after termination and decodes unconstrained
+-                    # to EOS/max_tokens -- that leak is what 0013 closes.
+-                    # Finishing here keeps the emitted output
++                    # DSV4 0013 TYPE-A / 0025 typeb-finish: the committed
++                    # prefix ends at a grammar boundary (TYPE-A) or at the
++                    # last FSM-accepted token (0025 policy=finish). Stock v1
++                    # only stops masking after termination and decodes
++                    # unconstrained to EOS/max_tokens -- that leak is what
++                    # 0013 closes. Finishing here keeps the emitted output
+                     # schema-valid; the request leaves the running set in
+                     # this iteration, so the truncated worker-side tail is
+                     # never consumed by a later spec window.
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -85,6 +85,15 @@
+ 
+ def _dsv4_0022_flags(text: str, finish_reason: str | None) -> list[str] | None:
+     """Classify a tools-request response body that emitted no tool call."""
++    # DSV4 0025: a well-formed but unclosed DSML envelope means the
++    # generation was cut inside the tool-call grammar (TYPE-B
++    # typeb-finish keeps an FSM-valid prefix) -- distinguish from the
++    # malformed pseudo-tag garbage the old commit policy produced.
++    if (
++        "<｜DSML｜tool_calls>" in text
++        and "</｜DSML｜tool_calls>" not in text
++    ):
++        return ["typeb_cut"]
+     if any(s in text for s in _DSV4_0022_SIGS):
+         return ["pseudo_tag"]
+     if finish_reason == "length":
