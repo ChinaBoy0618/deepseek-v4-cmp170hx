@@ -36,6 +36,7 @@ fi
 echo "[restart-dsv4] launching (load strategy: ${LOAD_STRATEGY}), log: $LOG"
 nohup bash run-pp-dspark.sh --maxlen 524288 > "$LOG" 2>&1 &
 
+MISSES=0  # consecutive docker-ps misses (3 = 30s grace for docker-run registration)
 for i in $(seq 1 360); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
          http://localhost:5700/health 2>/dev/null || true)
@@ -44,10 +45,16 @@ for i in $(seq 1 360); do
     exit 0
   fi
   if ! docker ps --format '{{.Names}}' | grep -q '^dsv4-a100$'; then
+    MISSES=$((MISSES + 1))
+    if [ "$MISSES" -lt 3 ]; then
+      sleep 10
+      continue
+    fi
     echo "[restart-dsv4] container died during startup; tail of $LOG:"
     tail -20 "$LOG"
     exit 1
   fi
+  MISSES=0
   sleep 10
 done
 echo "[restart-dsv4] NOT healthy after 60 min; check $LOG"

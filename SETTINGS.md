@@ -11,7 +11,7 @@ docker run -d --name dsv4 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   -v $R/v1/worker/gpu/model_runner.py:/vllm/vllm/v1/worker/gpu/model_runner.py:ro \
   -v $R/v1/worker/gpu/spec_decode/dspark/utils.py:/vllm/vllm/v1/worker/gpu/spec_decode/dspark/utils.py:ro \
   -v $R/model_executor/layers/sparse_attn_indexer.py:/vllm/vllm/model_executor/layers/sparse_attn_indexer.py:ro \
-  --shm-size=16g -p 8098:8000 \
+  --shm-size=64g -p 8098:8000 \
   dsv4-a100:devel vllm serve /model --served-model-name dsv4s \
   --pipeline-parallel-size 4 \
   --kv-cache-dtype fp8 \
@@ -19,7 +19,7 @@ docker run -d --name dsv4 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
   --max-model-len 32768 \
   --max-num-batched-tokens 2048 \
   --gpu-memory-utilization 0.85 \
-  --max-num-seqs 8 \
+  --max-num-seqs 32 \
   --trust-remote-code \
   --no-enable-flashinfer-autotune \
   --tokenizer-mode deepseek_v4 \
@@ -136,7 +136,7 @@ server-side with `--default-chat-template-kwargs`. **Use `high`, not `max`** —
 harder for identical recall. A top-level `reasoning_effort` body param is the ambiguous path; it
 changes behaviour but `/tokenize` cannot see it.
 
-### `--max-num-seqs 8`
+### `--max-num-seqs 32`
 Raise for serving. 128 was used for the concurrency sweeps and behaves well; DSpark keeps
 winning all the way to 64 concurrent requests on PP.
 
@@ -161,7 +161,7 @@ failure at model load on these cards: `expandable_segments: memory mapping faile
 device 3 while trying to map 20971520 bytes (free: 28626452480)`, i.e. it cannot map 20 MB
 with 28.6 GiB free. CUDA VMM appears broken on GA100 CMP parts.
 
-`--shm-size=16g` on the container — the default 64 MB is not enough for multiprocess workers.
+`--shm-size=64g` on the container — the default 64 MB is not enough for multiprocess workers.
 
 ---
 
