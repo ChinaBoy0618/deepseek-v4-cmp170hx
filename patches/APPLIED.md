@@ -41,7 +41,7 @@ Issue-replay state (2026-08-19 late, 0019v2 stack): verbatim issue-1/2 poison re
 
 0021 stack (2026-08-20): consecutive-tool replay B 2/2, E 3/3, A pass, hammer 200/200 (live validation, see commit 9396b68).
 
-## Staged — NOT yet applied on 760T container (2026-08-20)
+## Applied on 760T container 2026-08-20 13:2x (deployed + validated)
 
 Implemented for the 20260820 tool-call degradation RCA (fix-plan F2/F3/F4/F5).
 Base verified byte-identical to live container (md5 of all 5 target files
@@ -68,3 +68,13 @@ Note (resolved 2026-08-20): 0017v2-0021 were synced back to the repo via
 pull (commits ec71531..9396b68); the "live ahead of repo" drift is closed.
 0022+ layer cleanly on top of the 0021 stack (base md5s re-verified against
 the live container before patching).
+
+Deploy + live validation (2026-08-20 13:25): patched tree on 760T
+(/mnt/nvme1/dsv4/vllm-c3046d1) md5 == local validated md5s; mounts extended
+(serving.py / parser_engine.py / tokenizers/deepseek_v4.py added); relaunched
+with DSV4_PORT=5700 DSV4_MAXLEN=524288 (script defaults 8098/32768 — do not
+relaunch bare). Smoke: nonstream tools -> tool_calls clean; stream tools ->
+delta + finish=tool_calls; no-tools -> no flags. Tripwire live-fired:
+budget-cut probe (tools+auto, max_tokens=12) -> response dsv4_flags=
+["budget_burn"] + WARNING "DSV4 0022 envelope-missing" in server log. All
+0024 knobs remain OFF pending A/B. Rollback: cp *.bak-002N back + relaunch.
