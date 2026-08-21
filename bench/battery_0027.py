@@ -50,7 +50,7 @@ def req(i):
             k in d for k in ("name", "age", "city"))
     except Exception:
         ok = False
-    return ok, ch["finish_reason"], resp.get("usage", {}).get("completion_tokens"), c[:90], dt
+    return ok, ch["finish_reason"], resp.get("id"), resp.get("usage", {}).get("completion_tokens"), c[:90], dt
 
 
 total_ok = total = 0
@@ -63,5 +63,5 @@ for wave in range(3):
     print(f"[{TAG}] wave{wave}: {ok}/8 valid", flush=True)
     for r in rs:
         if not r[0]:
-            print(f"    BAD fin={r[1]} ct={r[2]} content={r[3]!r}", flush=True)
+            print(f"    BAD id={r[2]} fin={r[1]} ct={r[3]} content={r[4]!r}", flush=True)
 print(f"[{TAG}] TOTAL {total_ok}/{total} valid")

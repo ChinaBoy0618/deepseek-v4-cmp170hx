@@ -86,6 +86,7 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
   for f in config/speculative.py \
            v1/worker/gpu/pp_utils.py \
            v1/worker/gpu/model_runner.py \
+           v1/worker/gpu/spec_decode/utils.py \
            v1/worker/gpu/spec_decode/dspark/utils.py \
            v1/worker/gpu/spec_decode/dspark/speculator.py \
            v1/worker/gpu/spec_decode/rejection_sampler.py \
@@ -95,6 +96,7 @@ if [ -z "${DSV4_NO_MOUNT:-}" ]; then
            v1/structured_output/backend_xgrammar.py \
            v1/structured_output/__init__.py \
            v1/core/sched/scheduler.py \
+           v1/request.py \
            v1/core/sched/interface.py \
            v1/engine/core.py \
            parser/engine/adapters.py \
@@ -120,6 +122,7 @@ docker run -d --name dsv4-a100 --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0,1,2,
   -e HF_HUB_OFFLINE=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e DSV4_LOGITS_ROW_CHUNK="$ROW_CHUNK" \
   -e DSV4_TYPEB_POLICY="${DSV4_TYPEB_POLICY:-commit}" \
+  -e DSV4_TYPEB_DEBUG="${DSV4_TYPEB_DEBUG:-0}" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e VLLM_PP_LAYER_PARTITION=12,12,12,7 \
   -v $CACHE_DIR:/root/.cache \

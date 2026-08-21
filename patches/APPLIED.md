@@ -1,6 +1,6 @@
 # PATCH.md — applied patch stack on this checkout (vllm-c3046d1)
 
-Updated: 2026-08-21 02:45 +0800 (prod @5700 on 0027v2, TYPEB=commit)
+Updated: 2026-08-21 11:30 +0800 (prod @5700 on 0027v2+0028, TYPEB=commit)
 
 Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 
@@ -24,6 +24,7 @@ Current applied stack (per patches/ in deepseek-v4-cmp170hx repo):
 | 0020 | verify-output vocab clamp | rejection_sampler.py (+launch mount) | sampled.clamp_ after rejection_sample — OOB sentinel degrades one token instead of PP-wide embedding assert; closes the 0819-1142 crash path |
 | 0021 | raw-DSML history normalization | tokenizers/deepseek_v4_encoding.py (+launch mount) | extract COMPLETE DSML tool-call blocks from assistant content into structured tool_calls; raw-echo history renders canonically -> consecutive tool calls keep working (user-reported loop stall) |
 | 0027v2 | PP structured-output drain | v1/core/sched/{interface,scheduler}.py, v1/engine/core.py (+launch mounts for interface/core) | port of buliaoyin 6e959b2 / vllm#45015 queue-drain, adapted to sync Scheduler: in-flight-token criterion, defer+drain grammar bitmask sampling until older batches processed; v1 (ph-based) was live-crashed 0820 and replaced same day — see patches/0027-pp-structured-drain/PATCH.md |
+| 0028 | structured-output draft coverage under async PP | v1/worker/gpu/spec_decode/utils.py (+ drain guard in scheduler.py; mounts already present) | per-req persistent draft map in DraftTokensHandler: under the async engine a req decodes every pp_size steps (next_decode_eligible_step) and the single-slot snapshot loses its drafts before the deferred window rewrite -> [-1] placeholder -> unconstrained spec rows -> TYPE-B -> 0008 salvage -> corrupt tail (17-21/24). Fixed: 24/24 x2, TYPE-B 0. v1 (constrained -1 tail) disproven live 4/24; v2 (async drain predicate) correct-but-inert — see patches/0028-draft-rotation-coverage/PATCH.md |
 
 Backups on this tree: *.bak-<patch#> beside each patched file
 (scheduler.py.bak-0019v2 / deepseek_v4.py.bak-0018 are the immediate rollback points;
@@ -167,3 +168,34 @@ all regression suites PASS, hammer 200/200, prod relaunched on v2.
 - Authoritative launch stays: DSV4_PORT=5700 DSV4_MAXLEN=524288
   bash launch/run-pp-dspark.sh (model default is correct again; the old
   /mnt/data model path in the 16:40 command no longer exists).
+
+## 0028 — concurrent response_format corruption CLOSED (2026-08-21)
+
+RCA via six instrumentation stages (TYPEB-DBG → W1/W2/W3 → W4 setter-trace →
+diag6 IMM/TAKENONE/COVMISS/DEF; all reverted after). Root cause: engine runs
+AsyncScheduler (v2 model runner); a structured req decodes every pp_size=4
+steps (next_decode_eligible_step, scheduler.py:593), its drafts are proposed
+in its own batch's sample and consumed by the deferred window rewrite at its
+NEXT batch — but DraftTokensHandler is a single-slot snapshot, so 3 rotating
+batches overwrite the drafts first (diag6: COVMISS=236/322 deferrals). The
+window stays the [-1]*5 placeholder; stock grammar_bitmask leaves rows after
+the first -1 unconstrained → FSM-invalid drafts commit → TYPE-B → 0008
+salvage disables enforcement → corrupt tail. Single-request tests pass
+(producer/consumer adjacent in the slot); only 8-way concurrency rotates.
+
+- v1 (constrain rows after -1): RED→GREEN unit, FAILED live 4/24 (frozen
+  state doubles tokens: "namename", "{{"). Disproves constrained-tail as a
+  fix direction; stock -1 semantics are right GIVEN real drafts.
+- v2 (async ph-based drain predicate in has_structured_output_in_flight):
+  correct but inert under rotation (all 322 drains qlen=3 inflight=False —
+  a req's older batch has always left the queue). Kept as a guard.
+- v3 (SHIPPED): per-req draft map merged synchronously in set_draft_tokens,
+  returned as a FIFO-capped union from get_draft_tokens. tdd_0028 19/19,
+  battery 24/24 ×2, TYPE-B 0 / salvage 0 / Traceback 0, tdd_0027 GREEN,
+  consecutive tools/stream PASS, hammer 200/200, replay deltas 0.
+- All temporary diagnostics reverted in order (0028dbg → typebsrc3 →
+  typebsrc2 → typebsrc → typebdbg manual, its --revert was never
+  implemented); 0028 re-applied on the clean tree (baks refreshed:
+  .bak-0028v2/.bak-0028v3 = clean pre-0028 state). Verify: marker grep 0
+  hits, DSv4-0028:/0028v3 present, DSv4-0027 intact.
+- apply_0028dbg.py kept in bench/ as the RCA record (do not apply).
